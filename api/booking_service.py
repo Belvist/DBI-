@@ -25,11 +25,11 @@ class DialogueSession:
     """One patient conversation. Holds state + trace + last grounded facts."""
 
     def __init__(self, patient: PatientRef, adapter: ClinicAdapter,
-                 now: datetime | None = None) -> None:
+                 now: datetime | None = None, trace: Trace | None = None) -> None:
         self.patient = patient
         self.adapter = adapter
         self.state = DialogueState(patient=patient)
-        self.trace = Trace()
+        self.trace = trace or Trace()
         self.now = now or datetime.now()
         self.proposer = LlmProposer()
         self._allowed_dts: list[datetime] = []

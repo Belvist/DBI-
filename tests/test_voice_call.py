@@ -52,8 +52,12 @@ def test_make_vad_never_raises():
 
 
 class FakeSTT:
-    def transcribe_pcm16(self, pcm: bytes, sample_rate: int = 16000) -> str:
+    def __init__(self) -> None:
+        self.seen_call_ids: list = []
+
+    def transcribe_pcm16(self, pcm: bytes, sample_rate: int = 16000, call_id=None) -> str:
         assert len(pcm) > 3200
+        self.seen_call_ids.append(call_id)
         return "да"
 
 
@@ -61,7 +65,7 @@ class FakeTTS:
     def __init__(self) -> None:
         self.cancelled: list[str] = []
 
-    def synthesize(self, text: str):
+    def synthesize(self, text: str, call_id=None):
         return 16000, b"\x00\x01" * 8000, "g-test"
 
     def cancel(self, generation_id: str) -> None:

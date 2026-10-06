@@ -14,6 +14,7 @@ from datetime import datetime
 
 from api.booking_service import DialogueSession
 from domain.models import PatientRef
+from observability.trace import Trace
 from sessions.locks import patient_turn_lock
 
 
@@ -26,6 +27,7 @@ def run_turn(
     snapshots,
     redis_url: str,
     now: datetime | None = None,
+    trace: Trace | None = None,
 ) -> tuple[str, DialogueSession]:
     """Process one turn against authoritative state. Returns (speech, session).
 
@@ -36,7 +38,7 @@ def run_turn(
 
     with patient_turn_lock(redis_url, patient.patient_id) as lease:
         loaded = snapshots.load(patient.patient_id)
-        sess = DialogueSession(patient, adapter, now=now)
+        sess = DialogueSession(patient, adapter, now=now, trace=trace)
         if loaded is not None and loaded.patient.patient_id == patient.patient_id:
             sess.state = loaded
         pending = sess.state.pending_operation
