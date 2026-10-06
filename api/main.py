@@ -53,6 +53,8 @@ def _session(patient: PatientRef) -> DialogueSession:
 
 
 app.state.session_factory = _session
+app.state.identity = _IDENTITY
+app.state.snapshots = _SNAPSHOTS
 
 
 class TurnIn(BaseModel):

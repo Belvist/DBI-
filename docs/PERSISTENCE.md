@@ -7,8 +7,10 @@
   (`DBI_IDENTITY=tokenfile` + `DBI_TOKENS_FILE` JSON).
 - Fail-closed: нет токена → 401, чужой scope → 403. `patient_id` из body
   не может переопределить идентифицированного пациента.
-- WS `/voice/ws` (PR2) пока без auth: после мержа PR2 добавить `?token=`
-  тем же провайдером. HTTP уже закрыт.
+- WS `/voice/ws` авторизован через subprotocol `dbi-voice, <bearer-token>`
+  (токен НЕ в URL/query — не попадает в логи). `patient_id` из URL убран:
+  пациент определяется только IdentityProvider. Bearer-токены обязаны быть
+  subprotocol-safe (рекомендация: hex).
 
 ## Durability
 

@@ -23,7 +23,9 @@
   <div><b>Задержка хода</b><span id="dLat">—</span></div>
 </div>
 <div>
-  <button id="micBtn">🎤 Говорить</button>
+  <input type="text" id="tokenIn" value="demo" size="16" title="Bearer-токен пациента">
+  <button id="connBtn">Подключить</button>
+  <button id="micBtn" disabled>🎤 Говорить</button>
   <button id="stopBtn">⏹ Стоп</button>
 </div>
 <div id="log"></div>
@@ -34,11 +36,27 @@
 <p class="sys">STT/TTS — браузерные (Web Speech API, ru-RU). Перебивание: заговорите поверх ответа —
 синтез остановится мгновенно, сервер получит barge_in. Требует Chrome и микрофон (localhost/HTTPS).</p>
 <script>
-const pid = "voice-" + Math.random().toString(36).slice(2, 8);
-const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/voice/ws/" + pid);
 const log = document.getElementById("log");
 const micBtn = document.getElementById("micBtn");
 let speaking = false, micOn = false, lastGen = null;
+let ws = null;
+// Auth через subprotocol (не query string — токен не должен попадать в логи):
+// ["dbi-voice", "<bearer-token>"]. Пациент определяется только сервером.
+function connect() {
+  const token = document.getElementById("tokenIn").value.trim();
+  if (ws) { try { ws.close(); } catch (_) {} }
+  ws = new WebSocket(
+    (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/voice/ws",
+    ["dbi-voice", token]
+  );
+  ws.onopen = () => { sys("Соединение открыто. Нажмите «Говорить»."); micBtn.disabled = false; };
+  ws.onclose = (e) => {
+    sys(e.code === 4401 ? "Отказ: неверный токен (4401)." : "Соединение закрыто. Обновите страницу.");
+    micBtn.disabled = true;
+  };
+  ws.onmessage = onServerMessage;
+}
+document.getElementById("connBtn").onclick = connect;
 
 function line(cls, who, text) {
   const d = document.createElement("div");
@@ -47,9 +65,7 @@ function line(cls, who, text) {
 }
 function sys(t) { line("sys", "", t); }
 
-ws.onopen = () => sys("Соединение открыто. Нажмите «Говорить».");
-ws.onclose = () => sys("Соединение закрыто. Обновите страницу.");
-ws.onmessage = (ev) => {
+function onServerMessage(ev) {
   const m = JSON.parse(ev.data);
   if (m.type === "speech") {
     lastGen = m.gen_id;
@@ -63,7 +79,7 @@ ws.onmessage = (ev) => {
   } else if (m.type === "stopped") {
     sys("Остановлено (" + m.gen_id + "). Слушаю…");
   }
-};
+}
 
 function pickRuVoice() {
   const vs = speechSynthesis.getVoices();
@@ -86,6 +102,10 @@ function stopSpeaking() {
   if ("speechSynthesis" in window) speechSynthesis.cancel();
   speaking = false;
 }
+function send(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { sys("Нет соединения — нажмите «Подключить»."); return; }
+  ws.send(JSON.stringify(obj));
+}
 
 // ---- mic: Web Speech API, ru-RU, interim -> instant barge-in ----
 const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -104,11 +124,11 @@ if (!Rec) {
     if (speaking && interim) {
       // instant local barge-in + server-side cancel
       stopSpeaking();
-      try { ws.send(JSON.stringify({ type: "barge_in" })); } catch (_) {}
+      send({ type: "barge_in" });
     }
     if (fin) {
       line("u", "Пациент: ", heard);
-      ws.send(JSON.stringify({ type: "user_text", text: heard }));
+      send({ type: "user_text", text: heard });
     }
   };
   rec.onend = () => { micOn = false; micBtn.classList.remove("live"); micBtn.textContent = "🎤 Говорить"; };
@@ -123,13 +143,13 @@ micBtn.onclick = () => {
 document.getElementById("stopBtn").onclick = () => {
   stopSpeaking();
   if (rec && micOn) rec.stop();
-  try { ws.send(JSON.stringify({ type: "barge_in" })); } catch (_) {}
+  send({ type: "barge_in" });
 };
 document.getElementById("sendBtn").onclick = () => {
   const t = document.getElementById("textIn").value.trim();
   if (!t) return;
   line("u", "Пациент: ", t);
-  ws.send(JSON.stringify({ type: "user_text", text: t }));
+  send({ type: "user_text", text: t });
   document.getElementById("textIn").value = "";
 };
 </script>
