@@ -228,13 +228,46 @@ def test_deny_during_uncertain_never_abandons_operation():
     assert sess.state.pending_operation is not None
     assert sess.state.pending_operation.status == "uncertain"
 
-    # starting a new booking and confirming another slot is blocked
+    # a new BOOK request is held, not started: state untouched
     flaky.drop = False
-    sess.turn("Запиши меня к кардиологу на следующей неделе")
-    assert sess.state.candidates
-    blocked = sess.turn("Первый вариант")
-    assert "неподтвержд" in blocked.lower()
+    held = sess.turn("Запиши меня к кардиологу на следующей неделе")
+    assert "проверил" in held.lower() or "неподтвержд" in held.lower()
+    assert sess.state.specialty == "neurology"
+    # «да» reconciles the ORIGINAL operation instead of booking cardio
+    done = sess.turn("Да")
+    assert "записаны" in done.lower()
     assert len(sqlite.get_appointments(sess.patient)) == 1
+
+
+def test_new_request_during_uncertain_mutates_nothing():
+    """The stuck-loop scenario: unknown WRITE, then a fresh BOOK request.
+
+    The new request must not rewind flow/candidates/selection; the next
+    «да» reconciles the ORIGINAL operation instead of wedging forever.
+    """
+    sqlite = MockSqliteClinic()
+    flaky = CommitThenDrop(sqlite)
+    sess = DialogueSession(
+        PatientRef(patient_id="p-stuck"), ResilientAdapter(flaky), now=NOW
+    )
+    _drive_to_confirm(sess)
+    assert "не удалось подтвердить" in sess.turn("Да").lower()
+    before = sess.state.model_dump()
+
+    blocked = sess.turn("Нет, тогда запиши меня к кардиологу на следующей неделе")
+    assert "проверил" in blocked.lower() or "неподтвержд" in blocked.lower()
+    after = sess.state.model_dump()
+    # nothing mutated except the turn counter
+    before.pop("turn")
+    after.pop("turn")
+    assert before == after
+
+    # reconcile with the backend recovered
+    flaky.drop = False
+    speech = sess.turn("Да")
+    assert "записаны" in speech.lower()
+    assert len(sqlite.get_appointments(sess.patient)) == 1
+    assert sess.state.pending_operation is None
 
 
 def test_explicit_key_rebind_during_uncertain_is_409(tmp_path):

@@ -280,6 +280,11 @@ class MockSqliteClinic:
                     self._conn.rollback()
                     raise SlotNotFound(f"unknown slot {cmd.slot_id}")
                 if s["taken_by"] is not None:
+                    # Same re-check as Postgres: a concurrent same-key retry
+                    # may have committed while we waited on the write lock.
+                    if self._find_op(cur, pid, "create", cmd.idempotency_key) is not None:
+                        self._conn.commit()
+                        return self._resolve_op(pid, "create", cmd.idempotency_key, fp)
                     self._conn.rollback()
                     raise SlotUnavailable(f"slot {cmd.slot_id} just taken")
                 booking_id = "A" + uuid.uuid4().hex[:6].upper()
@@ -329,10 +334,10 @@ class MockSqliteClinic:
                     "SELECT * FROM appointments WHERE booking_id=? AND patient_id=?",
                     (cmd.booking_id, pid),
                 ).fetchone()
-                if old is None:
-                    self._conn.rollback()
-                    raise AppointmentNotFound(f"unknown booking {cmd.booking_id}")
-                if old["status"] != AppointmentStatus.ACTIVE.value:
+                if old is None or old["status"] != AppointmentStatus.ACTIVE.value:
+                    if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                        self._conn.commit()
+                        return self._resolve_op(pid, "reschedule", cmd.idempotency_key, fp)
                     self._conn.rollback()
                     raise AppointmentNotFound(f"booking {cmd.booking_id} not active")
                 tgt = cur.execute(
@@ -343,6 +348,9 @@ class MockSqliteClinic:
                     self._conn.rollback()
                     raise SlotNotFound(f"unknown slot {cmd.new_slot_id}")
                 if tgt["taken_by"] is not None:
+                    if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                        self._conn.commit()
+                        return self._resolve_op(pid, "reschedule", cmd.idempotency_key, fp)
                     self._conn.rollback()
                     raise SlotUnavailable(f"slot {cmd.new_slot_id} just taken")
                 # free old slot, take new one, mark old appt moved, insert new appt

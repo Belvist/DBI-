@@ -112,6 +112,38 @@ def test_same_key_isolated_across_kinds():
         )
 
 
+def test_concurrent_same_key_create_returns_one_booking():
+    import threading
+
+    a = MockSqliteClinic()
+    p = PatientRef(patient_id="p-conc")
+    slot = a.find_slots(limit=5)[0].slot.slot_id
+    ik = "ik-conc-1"
+    barrier = threading.Barrier(2)
+    results: list = []
+    errors: list = []
+
+    def run():
+        try:
+            barrier.wait(timeout=10)
+            results.append(
+                a.create_appointment(
+                    CreateAppointmentCommand(patient=p, slot_id=slot, idempotency_key=ik)
+                ).booking_id
+            )
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert results[0] == results[1]
+    assert len(a.get_appointments(p)) == 1
+
+
 def test_race_stolen_slot_raises():
     a = MockSqliteClinic()
     cmd = _cmd(a)

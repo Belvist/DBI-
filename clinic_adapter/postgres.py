@@ -262,6 +262,10 @@ class PostgresClinic:
                 if s is None:
                     raise SlotNotFound(f"unknown slot {cmd.slot_id}")
                 if s["taken_by"] is not None:
+                    # A concurrent SAME operation may have committed while we
+                    # waited on the row lock: re-check before crying conflict.
+                    if self._find_op(cur, pid, "create", cmd.idempotency_key) is not None:
+                        return self._resolve_op(cur, pid, "create", cmd.idempotency_key, fp)
                     raise SlotUnavailable(f"slot {cmd.slot_id} just taken")
                 cur.execute(
                     """INSERT INTO appointments
@@ -314,6 +318,10 @@ class PostgresClinic:
                 )
                 old = cur.fetchone()
                 if old is None or old["status"] != AppointmentStatus.ACTIVE.value:
+                    # The winner of a concurrent same-key retry marks the old
+                    # booking moved: re-check before reporting it missing.
+                    if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                        return self._resolve_op(cur, pid, "reschedule", cmd.idempotency_key, fp)
                     raise AppointmentNotFound(
                         f"booking {cmd.booking_id} not active"
                     )
@@ -326,6 +334,8 @@ class PostgresClinic:
                 if tgt is None:
                     raise SlotNotFound(f"unknown slot {cmd.new_slot_id}")
                 if tgt["taken_by"] is not None:
+                    if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                        return self._resolve_op(cur, pid, "reschedule", cmd.idempotency_key, fp)
                     raise SlotUnavailable(f"slot {cmd.new_slot_id} just taken")
                 cur.execute(
                     "UPDATE slots SET taken_by=NULL WHERE slot_id=%s",

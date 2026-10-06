@@ -41,7 +41,12 @@
 - WRITE-упал → «не удалось подтвердить, могла сохраниться». Операция уже
   имеет durable identity (`pending_operation` создаётся при CONFIRM-выборе):
   ретрай переиспользует ТОТ ЖЕ `idempotency_key`, backend возвращает
-  исходную запись. Явно переданный ключ API всегда побеждает pending.
+  исходную запись. Явно переданный ключ API побеждает pending только ДО
+  первого WRITE (статус `prepared`); при `uncertain` ключ immutable —
+  чужой ключ отклоняется с 409 `operation_in_progress`.
+- Пока `uncertain` висит, новые BOOK/RESCHEDULE/CORRECT/DENY не мутируют
+  state (guard в `step()`); CONFIRM идёт в `reconcile_pending()` только по
+  полям pending; STATUS доступен всегда (read-only).
 - Production требует `DBI_PG_URL` всегда и Redis либо `DBI_SINGLE_REPLICA=1.
 - Миграции сериализованы advisory lock; `/ready` проверяет и Redis.
 

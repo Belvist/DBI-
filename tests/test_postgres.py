@@ -94,6 +94,71 @@ def test_pg_reschedule_and_isolation():
 
 
 @needs_pg
+def test_pg_concurrent_same_key_create_and_reschedule():
+    import threading
+
+    c = _clinic()
+    pid = f"conc-{uuid.uuid4().hex[:6]}"
+    p = PatientRef(patient_id=pid)
+    slot = c.find_slots(limit=5)[0].slot.slot_id
+    ik = f"ik-conc-{uuid.uuid4().hex[:6]}"
+    barrier = threading.Barrier(2)
+    results: list = []
+    errors: list = []
+
+    def run_create():
+        try:
+            barrier.wait(timeout=15)
+            results.append(
+                c.create_appointment(
+                    CreateAppointmentCommand(patient=p, slot_id=slot, idempotency_key=ik)
+                ).booking_id
+            )
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run_create) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert results[0] == results[1]
+    assert len(c.get_appointments(p)) == 1
+
+    # same for reschedule: both threads move the same booking with same key
+    created = c.get_appointments(p)[0]
+    target = next(s for s in c.find_slots(limit=30) if s.slot.start != created.start)
+    rik = f"ik-conc-r-{uuid.uuid4().hex[:6]}"
+    barrier2 = threading.Barrier(2)
+    results2: list = []
+    errors2: list = []
+
+    def run_move():
+        try:
+            barrier2.wait(timeout=15)
+            results2.append(
+                c.reschedule_appointment(
+                    RescheduleCommand(
+                        patient=p, booking_id=created.booking_id,
+                        new_slot_id=target.slot.slot_id, idempotency_key=rik,
+                    )
+                ).booking_id
+            )
+        except Exception as e:
+            errors2.append(e)
+
+    threads = [threading.Thread(target=run_move) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors2, errors2
+    assert results2[0] == results2[1]
+    assert len(c.get_appointments(p)) == 1
+
+
+@needs_pg
 def test_pg_scoped_idempotency():
     from domain.errors import IdempotencyConflict
 
