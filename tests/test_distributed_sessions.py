@@ -83,6 +83,32 @@ def test_local_lock_serializes_turns():
 
 
 @needs_redis
+def test_redis_lock_survives_past_lease_via_heartbeat():
+    # Lease 2s, turn holds 5s: without renewal the contender would get in.
+    entered: list[bool] = []
+
+    def holder():
+        with patient_turn_lock(REDIS_URL, "p-heartbeat", timeout_s=10, lease_s=2):
+            import time as _t
+
+            _t.sleep(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    import time as _t
+
+    _t.sleep(0.5)
+    try:
+        with pytest.raises(TimeoutError), patient_turn_lock(
+            REDIS_URL, "p-heartbeat", timeout_s=3, lease_s=2
+        ):
+            entered.append(True)
+    finally:
+        t.join()
+    assert not entered
+
+
+@needs_redis
 def test_redis_lock_timeout_when_held():
     import redis
 
@@ -112,3 +138,18 @@ def test_cache_factory_called_once():
     obj = cache.get_or_create("k", lambda: calls.append(1) or object())
     assert cache.get_or_create("k", lambda: object()) is obj
     assert len(calls) == 1
+
+
+def test_cache_thread_safety_smoke():
+    cache: SessionCache[int] = SessionCache(maxsize=50, idle_ttl_s=60)
+
+    def hammer(n: int):
+        for i in range(200):
+            cache.get_or_create(f"k{(n + i) % 60}", lambda i=i: i)
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(cache) <= 50

@@ -30,5 +30,15 @@
 
 ## Redis
 
-Отложен в PR4 (распределённые локи + resilience). Сессии переживают
-рестарт уже сейчас через снапшоты; Redis — ускорение, а не условие выживания.
+Снапшоты с TTL + per-patient локи с heartbeat-продлением lease
+(атомарный Lua compare-and-expire — redis-py держит токен thread-local,
+`reacquire()` из другого потока молча умирал). Без Redis — процессные
+локи (только single-replica).
+
+## Fail-safe исходы
+
+- READ-упал → «ничего не записано и не изменено» (честно: мутаций не было).
+- WRITE-упал → «не удалось подтвердить, могла сохраниться» + ретрай бьёт
+  в ТОТ ЖЕ слот: взятый слот даёт SlotUnavailable → re-search, дубля нет.
+- Production требует `DBI_PG_URL` всегда и Redis либо `DBI_SINGLE_REPLICA=1.
+- Миграции сериализованы advisory lock; `/ready` проверяет и Redis.

@@ -22,10 +22,31 @@ def test_production_forbids_seed_even_explicit():
               "DBI_TOKENS_FILE": "t.json", "DBI_ALLOW_SEED": "1"})
 
 
+def _prod_base():
+    return {"DBI_ENV": "production", "DBI_IDENTITY": "tokenfile",
+            "DBI_TOKENS_FILE": "t.json", "DBI_PG_URL": "postgresql://x/y",
+            "DBI_REDIS_URL": "redis://x/0"}
+
+
 def test_production_ok_with_tokenfile():
-    s = load({"DBI_ENV": "production", "DBI_IDENTITY": "tokenfile",
-              "DBI_TOKENS_FILE": "t.json"})
+    s = load(_prod_base())
     assert not s.allow_seed
+
+
+def test_production_requires_postgres():
+    env = _prod_base()
+    del env["DBI_PG_URL"]
+    with pytest.raises(RuntimeError):
+        load(env)
+
+
+def test_production_requires_redis_or_single_replica():
+    env = _prod_base()
+    del env["DBI_REDIS_URL"]
+    with pytest.raises(RuntimeError):
+        load(env)
+    env["DBI_SINGLE_REPLICA"] = "1"
+    assert load(env).single_replica
 
 
 def test_tokenfile_requires_file():

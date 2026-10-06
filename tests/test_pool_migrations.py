@@ -30,6 +30,28 @@ def _applied_names() -> list[str]:
 
 
 @needs_pg
+def test_concurrent_migration_runners_elect_one_applier():
+    from clinic_adapter.migrate import apply
+
+    results: list = []
+    errors: list = []
+
+    def run():
+        try:
+            results.append(apply(PG_URL))
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    assert "001_init.sql" in _applied_names()
+
+
+@needs_pg
 def test_pool_serves_concurrent_readers():
     c = PostgresClinic(url=PG_URL, pool_max=4)
     try:

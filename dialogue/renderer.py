@@ -117,5 +117,16 @@ def temporarily_unavailable() -> str:
     )
 
 
+def outcome_unknown() -> str:
+    # WRITE-path failure: the booking MAY have committed server-side while
+    # the response was lost. Claiming "nothing was recorded" would be a lie.
+    return (
+        "Не удалось подтвердить результат — связь с клиникой прервалась "
+        "в момент записи. Я не буду утверждать, создана запись или нет: "
+        "она могла сохраниться. Скажите «да», и я проверю тот же вариант, "
+        "или выберите другое время."
+    )
+
+
 def unknown() -> str:
     return "Не совсем поняла. Вы хотите записаться, узнать свою запись или перенести её?"

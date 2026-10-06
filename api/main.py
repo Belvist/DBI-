@@ -100,7 +100,7 @@ def health() -> dict:
 
 @app.get("/ready")
 def ready() -> dict:
-    """Readiness: adapter reachable + pool stats. 503 when the backend is down."""
+    """Readiness: adapter AND session store reachable. 503 when any is down."""
     from fastapi import HTTPException
 
     try:
@@ -113,6 +113,8 @@ def ready() -> dict:
                 "available": stats.get("pool_available"),
                 "used": stats.get("pool_used"),
             }
+        _SNAPSHOTS.ping()
+        detail["snapshots"] = "ok"
         return {"status": "ready", **detail}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"backend down: {type(e).__name__}") from e

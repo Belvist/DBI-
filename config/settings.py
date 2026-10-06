@@ -21,6 +21,7 @@ class Settings:
     db_path: str
     sessions_path: str
     redis_url: str
+    single_replica: bool
     allow_seed: bool
 
 
@@ -50,14 +51,26 @@ def load(env: dict[str, str] | None = None) -> Settings:
         raise RuntimeError("DBI_PG_POOL_MAX must be an integer") from None
     if pool_max < 1:
         raise RuntimeError("DBI_PG_POOL_MAX must be >= 1")
+    pg_url = src.get("DBI_PG_URL", "")
+    redis_url = src.get("DBI_REDIS_URL", "")
+    single_replica = src.get("DBI_SINGLE_REPLICA", "") == "1"
+    if mode == "production":
+        if not pg_url:
+            raise RuntimeError("DBI_ENV=production requires DBI_PG_URL (no ephemeral DB)")
+        if not redis_url and not single_replica:
+            raise RuntimeError(
+                "DBI_ENV=production requires DBI_REDIS_URL "
+                "or explicit DBI_SINGLE_REPLICA=1"
+            )
     return Settings(
         env=mode,
         identity_mode=identity_mode,
         tokens_file=tokens_file,
-        pg_url=src.get("DBI_PG_URL", ""),
+        pg_url=pg_url,
         pg_pool_max=pool_max,
         db_path=src.get("DBI_DB_PATH", ":memory:"),
         sessions_path=src.get("DBI_SESSIONS_PATH", ":memory:"),
-        redis_url=src.get("DBI_REDIS_URL", ""),
+        redis_url=redis_url,
+        single_replica=single_replica,
         allow_seed=allow_seed,
     )

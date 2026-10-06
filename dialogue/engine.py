@@ -343,6 +343,19 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
         state.active_booking_id = appt.booking_id
         return state, renderer.booked(appt, d)
 
+    except AdapterUnavailable:
+        # WRITE outcome unknown: the booking may have committed server-side
+        # while the response was lost. Keep the selected slot so a retry
+        # hits the SAME slot: if it committed, the adapter answers
+        # SlotUnavailable (taken) and we recover via re-search instead of
+        # ever double-booking.
+        from observability import metrics
+
+        ctx.trace.log("commit_outcome_unknown", slot=state.selected_slot_id)
+        metrics.inc("fallbacks_total")
+        state.phase = Phase.CONFIRM
+        return state, renderer.outcome_unknown()
+
     except SlotUnavailable:
         ctx.trace.log("race_taken", slot=state.selected_slot_id)
         slots = _search_booking(state, adapter)
