@@ -67,14 +67,22 @@ CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id, status);
 """
 
 class MockSqliteClinic:
-    def __init__(self, path: str | Path = ":memory:", seed_base: datetime | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        seed_base: datetime | None = None,
+        seed: bool = True,
+    ) -> None:
         self._path = str(path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
-            if self._conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0] == 0:
+            if (
+                seed
+                and self._conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0] == 0
+            ):
                 self._seed(seed_base or SEED_BASE)
 
     # ---------- seed ----------

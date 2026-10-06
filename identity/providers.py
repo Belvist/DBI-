@@ -80,12 +80,14 @@ class TokenFileIdentityProvider:
             raise UnknownIdentity("unknown bearer token") from None
 
 
-def resolve_provider() -> IdentityProvider:
-    mode = os.getenv("DBI_IDENTITY", "demo")
+def resolve_provider(
+    mode: str | None = None, tokens_file: str | None = None
+) -> IdentityProvider:
+    mode = mode if mode is not None else os.getenv("DBI_IDENTITY", "demo")
     if mode == "demo":
         return DemoIdentityProvider()
     if mode == "tokenfile":
-        path = os.getenv("DBI_TOKENS_FILE", "")
+        path = tokens_file if tokens_file is not None else os.getenv("DBI_TOKENS_FILE", "")
         if not path:
             raise RuntimeError("DBI_IDENTITY=tokenfile requires DBI_TOKENS_FILE")
         return TokenFileIdentityProvider(path)

@@ -1,6 +1,6 @@
 """Postgres-backed clinic. Same contract as the SQLite mock, real durability.
 
-- One connection per operation (hackathon scale; pool lands with load work).
+- Pooled connections (psycopg_pool); schema managed by migrations/*.sql.
 - WRITE runs in a transaction with SELECT ... FOR UPDATE on the slot row,
   so cross-process races serialize in the database, not in a process lock.
 - Cross-process duplicate COMMIT is closed by the UNIQUE idempotency_key:
@@ -18,7 +18,9 @@ from datetime import datetime, timedelta
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
+from clinic_adapter.migrate import apply as apply_migrations
 from clinic_adapter.seed_data import SEED_BASE, SEED_DOCTORS, seed_slots
 from clinic_adapter.seed_data import dt as _dt
 from clinic_adapter.seed_data import ts as _s
@@ -39,61 +41,46 @@ from domain.models import (
     Specialty,
 )
 
-_DDL = """
-CREATE TABLE IF NOT EXISTS doctors(
-  doctor_id TEXT PRIMARY KEY,
-  full_name TEXT NOT NULL,
-  short_name TEXT NOT NULL,
-  specialty TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS slots(
-  slot_id TEXT PRIMARY KEY,
-  doctor_id TEXT NOT NULL REFERENCES doctors(doctor_id),
-  start_ts TEXT NOT NULL,
-  end_ts TEXT NOT NULL,
-  taken_by TEXT NULL
-);
-CREATE TABLE IF NOT EXISTS appointments(
-  booking_id TEXT PRIMARY KEY,
-  patient_id TEXT NOT NULL,
-  doctor_id TEXT NOT NULL REFERENCES doctors(doctor_id),
-  slot_id TEXT NOT NULL,
-  start_ts TEXT NOT NULL,
-  end_ts TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'active',
-  idempotency_key TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_slots_doc_start ON slots(doctor_id, start_ts);
-CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id, status);
-"""
-
 _CONNECT_TIMEOUT = 5
 _STATEMENT_TIMEOUT_MS = 5000
 
 
 class PostgresClinic:
-    def __init__(self, url: str | None = None, seed_base: datetime | None = None) -> None:
+    def __init__(
+        self,
+        url: str | None = None,
+        seed_base: datetime | None = None,
+        seed: bool = True,
+        pool_max: int = 10,
+    ) -> None:
         self._url = url or os.getenv("DBI_PG_URL", "")
         if not self._url:
             raise NotConfigured("DBI_PG_URL is not set")
         self._seed_base = seed_base or SEED_BASE
+        self._allow_seed = seed
+        self._pool = ConnectionPool(
+            self._url,
+            min_size=1,
+            max_size=max(1, pool_max),
+            timeout=10,
+            open=True,
+            kwargs={
+                "row_factory": dict_row,
+                "connect_timeout": _CONNECT_TIMEOUT,
+                "options": f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+            },
+        )
         self._init_schema()
 
-    def _connect(self):
-        return psycopg.connect(
-            self._url,
-            row_factory=dict_row,
-            connect_timeout=_CONNECT_TIMEOUT,
-            options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
-        )
+    def close(self) -> None:
+        self._pool.close()
 
     def _init_schema(self) -> None:
-        with self._connect() as conn:
+        apply_migrations(self._url)
+        with self._pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(_DDL)
                 cur.execute("SELECT COUNT(*) AS n FROM doctors")
-                if cur.fetchone()["n"] == 0:  # type: ignore[index]
+                if self._allow_seed and cur.fetchone()["n"] == 0:  # type: ignore[index]
                     for doctor_id, full, short, spec in SEED_DOCTORS:
                         cur.execute(
                             "INSERT INTO doctors(doctor_id, full_name, short_name, specialty)"
@@ -119,7 +106,7 @@ class PostgresClinic:
         if specialty is not None:
             q += " AND specialty=%s"
             args.append(specialty.value)
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(q, args)
             rows = cur.fetchall()
         out = [
@@ -200,7 +187,7 @@ class PostgresClinic:
             args.append(_s(date_to))
         q += " ORDER BY s.start_ts ASC LIMIT %s"
         args.append(limit * 4)
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(q, args)
             out = [self._to_swd(r) for r in cur.fetchall()]
         if time_pref == "morning":
@@ -210,7 +197,7 @@ class PostgresClinic:
         return out[:limit]
 
     def get_appointments(self, patient: PatientRef) -> list[Appointment]:
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM appointments WHERE patient_id=%s AND status='active'"
                 " ORDER BY start_ts ASC",
@@ -237,7 +224,7 @@ class PostgresClinic:
         booking_id = "A" + uuid.uuid4().hex[:6].upper()
         now = _s(datetime.now().replace(second=0, microsecond=0))
         try:
-            with self._connect() as conn, conn.cursor() as cur, conn.transaction():
+            with self._pool.connection() as conn, conn.cursor() as cur, conn.transaction():
                 if (row := self._by_key(cur, cmd.idempotency_key)) is not None:
                     return self._to_appt(row)
                 cur.execute(
@@ -268,11 +255,11 @@ class PostgresClinic:
         except psycopg.errors.UniqueViolation:
             # Lost a cross-process insert race on idempotency_key: the winner's
             # row is the truth — return it instead of a duplicate.
-            with self._connect() as conn, conn.cursor() as cur:
+            with self._pool.connection() as conn, conn.cursor() as cur:
                 row = self._by_key(cur, cmd.idempotency_key)
                 assert row is not None
                 return self._to_appt(row)
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM appointments WHERE booking_id=%s", (booking_id,)
             )
@@ -282,7 +269,7 @@ class PostgresClinic:
         new_id = "A" + uuid.uuid4().hex[:6].upper()
         now = _s(datetime.now().replace(second=0, microsecond=0))
         try:
-            with self._connect() as conn, conn.cursor() as cur, conn.transaction():
+            with self._pool.connection() as conn, conn.cursor() as cur, conn.transaction():
                 if (row := self._by_key(cur, cmd.idempotency_key)) is not None:
                     return self._to_appt(row)
                 cur.execute(
@@ -329,11 +316,11 @@ class PostgresClinic:
                     ),
                 )
         except psycopg.errors.UniqueViolation:
-            with self._connect() as conn, conn.cursor() as cur:
+            with self._pool.connection() as conn, conn.cursor() as cur:
                 row = self._by_key(cur, cmd.idempotency_key)
                 assert row is not None
                 return self._to_appt(row)
-        with self._connect() as conn, conn.cursor() as cur:
+        with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM appointments WHERE booking_id=%s", (new_id,)
             )
@@ -341,7 +328,7 @@ class PostgresClinic:
 
     def purge_stale_idempotency_keys(self, older_than_days: int = 30) -> int:
         cutoff = _s(datetime.now() - timedelta(days=older_than_days))
-        with self._connect() as conn:
+        with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """SELECT booking_id FROM appointments
@@ -359,7 +346,7 @@ class PostgresClinic:
             return len(ids)
 
     def steal_slot(self, slot_id: str, by: str = "other_patient") -> None:
-        with self._connect() as conn:
+        with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE slots SET taken_by=%s WHERE slot_id=%s", (by, slot_id)

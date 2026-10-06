@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 
-from fastapi import FastAPI, Header
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from api.booking_service import DialogueSession
 from api.voice_ws import router as voice_router
 from clinic_adapter.mock_sqlite import MockSqliteClinic
+from clinic_adapter.resilient import ResilientAdapter
+from config.settings import load as load_settings
 from domain.models import PatientRef
 from identity.deps import identify_patient, require_scope
 from identity.providers import resolve_provider
+from observability import metrics
+from sessions.cache import SessionCache
+from sessions.locks import patient_turn_lock
 from sessions.store import SessionStore
 from voice.stt import BrowserSTT
 from voice.tts import BrowserTTS
@@ -24,37 +28,56 @@ log = logging.getLogger("dbi.api")
 app = FastAPI(title="DBI Clinic Assistant", version="0.2.0")
 app.include_router(voice_router)
 
-_DB_PATH = os.getenv("DBI_DB_PATH", ":memory:")
-_PG_URL = os.getenv("DBI_PG_URL", "")
-if _PG_URL:
+_SETTINGS = load_settings()
+if _SETTINGS.pg_url:
     from clinic_adapter.postgres import PostgresClinic
 
-    _ADAPTER = PostgresClinic(url=_PG_URL)
-    log.info("clinic adapter=postgres")
+    _BASE = PostgresClinic(
+        url=_SETTINGS.pg_url, seed=_SETTINGS.allow_seed, pool_max=_SETTINGS.pg_pool_max
+    )
+    log.info("clinic adapter=postgres seed=%s", _SETTINGS.allow_seed)
 else:
-    _ADAPTER = MockSqliteClinic(path=_DB_PATH)
-    log.info("clinic adapter=sqlite path=%s", _DB_PATH)
-_IDENTITY = resolve_provider()
-_SNAPSHOTS = SessionStore(path=os.getenv("DBI_SESSIONS_PATH", ":memory:"))
-_SESSIONS: dict[str, DialogueSession] = {}
+    _BASE = MockSqliteClinic(path=_SETTINGS.db_path, seed=_SETTINGS.allow_seed)
+    log.info("clinic adapter=sqlite path=%s seed=%s", _SETTINGS.db_path, _SETTINGS.allow_seed)
+_ADAPTER = ResilientAdapter(_BASE)
+_IDENTITY = resolve_provider(_SETTINGS.identity_mode, _SETTINGS.tokens_file)
+if _SETTINGS.redis_url:
+    from sessions.redis_store import RedisSessionStore
+
+    _SNAPSHOTS = RedisSessionStore(_SETTINGS.redis_url)
+    log.info("snapshots=redis")
+else:
+    _SNAPSHOTS = SessionStore(path=_SETTINGS.sessions_path)
+    log.info("snapshots=sqlite path=%s", _SETTINGS.sessions_path)
+_SESSIONS: SessionCache[DialogueSession] = SessionCache(maxsize=1000, idle_ttl_s=3600)
 _DEMO_NOW = datetime(2026, 10, 13, 12, 0)
 _STT = BrowserSTT()
 _TTS = BrowserTTS()
 
 
 def _session(patient: PatientRef) -> DialogueSession:
-    if patient.patient_id not in _SESSIONS:
+    def _build() -> DialogueSession:
         sess = DialogueSession(patient, _ADAPTER, now=_DEMO_NOW)
         restored = _SNAPSHOTS.load(patient.patient_id)
         if restored is not None and restored.patient.patient_id == patient.patient_id:
             sess.state = restored
-        _SESSIONS[patient.patient_id] = sess
-    return _SESSIONS[patient.patient_id]
+        return sess
+
+    return _SESSIONS.get_or_create(patient.patient_id, _build)
+
+
+def _turn_locked(patient: PatientRef, text: str, idempotency_key: str | None) -> str:
+    with patient_turn_lock(_SETTINGS.redis_url, patient.patient_id):
+        sess = _session(patient)
+        speech = sess.turn(text, idempotency_key=idempotency_key)
+        _SNAPSHOTS.save(sess.state)
+        return speech
 
 
 app.state.session_factory = _session
 app.state.identity = _IDENTITY
 app.state.snapshots = _SNAPSHOTS
+app.state.redis_url = _SETTINGS.redis_url
 
 
 class TurnIn(BaseModel):
@@ -68,10 +91,36 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "dbi-assistant",
+        "env": _SETTINGS.env,
         "identity": type(_IDENTITY).__name__,
         "stt": _STT.describe(),
         "tts": _TTS.describe(),
     }
+
+
+@app.get("/ready")
+def ready() -> dict:
+    """Readiness: adapter reachable + pool stats. 503 when the backend is down."""
+    from fastapi import HTTPException
+
+    try:
+        _ADAPTER.find_doctors()
+        detail: dict = {"adapter": "ok"}
+        pool = getattr(getattr(_ADAPTER, "_base", None), "_pool", None)
+        if pool is not None:
+            stats = pool.get_stats()
+            detail["pool"] = {
+                "available": stats.get("pool_available"),
+                "used": stats.get("pool_used"),
+            }
+        return {"status": "ready", **detail}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"backend down: {type(e).__name__}") from e
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics() -> str:
+    return metrics.render_prometheus()
 
 
 @app.get("/doctors")
@@ -93,7 +142,12 @@ def slots(specialty: str | None = None, time_pref: str | None = None):
 def appointments(
     patient_id: str, x_patient_token: str | None = Header(default=None, alias="X-Patient-Token")
 ):
-    patient = require_scope(identify_patient(_IDENTITY, x_patient_token), patient_id)
+    try:
+        patient = require_scope(identify_patient(_IDENTITY, x_patient_token), patient_id)
+    except HTTPException as e:
+        if e.status_code in (401, 403):
+            metrics.inc("auth_failures_total")
+        raise
     return [a.model_dump(mode="json") for a in _ADAPTER.get_appointments(patient)]
 
 
@@ -101,10 +155,17 @@ def appointments(
 def dialogue_turn(
     inp: TurnIn, x_patient_token: str | None = Header(default=None, alias="X-Patient-Token")
 ):
-    patient = require_scope(identify_patient(_IDENTITY, x_patient_token), inp.patient_id)
+    try:
+        patient = require_scope(identify_patient(_IDENTITY, x_patient_token), inp.patient_id)
+    except HTTPException as e:
+        if e.status_code in (401, 403):
+            metrics.inc("auth_failures_total")
+        raise
+    try:
+        speech = _turn_locked(patient, inp.text, inp.idempotency_key)
+    except TimeoutError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
     s = _session(patient)
-    speech = s.turn(inp.text, idempotency_key=inp.idempotency_key)
-    _SNAPSHOTS.save(s.state)
     return {
         "speech": speech,
         "phase": s.state.phase.value,

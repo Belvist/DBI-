@@ -23,8 +23,16 @@ jobs:
         options: >-
           --health-cmd="pg_isready -U postgres"
           --health-interval=5s --health-timeout=3s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=3s --health-retries=10
     env:
       DBI_PG_URL: postgresql://postgres:postgres@localhost:5432/dbi
+      DBI_REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -38,8 +46,8 @@ jobs:
 
       - name: Lint
         run: >-
-          python -m ruff check domain clinic_adapter nlu dialogue api voice
-          observability demo tests identity sessions
+          python -m ruff check config domain clinic_adapter nlu dialogue api
+          voice observability demo tests identity sessions resilience
 
       - name: Unit tests (incl. Postgres parity)
         run: PYTHONPATH=. python -m pytest tests/ -q

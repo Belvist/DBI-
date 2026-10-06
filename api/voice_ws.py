@@ -24,17 +24,25 @@ Message protocol (JSON, client <-> server):
 Barge-in semantics mirror `voice/runtime.py`: the in-flight generation is
 cancelled server-side; the browser ALSO cancels speechSynthesis locally so
 the stop is instant even before the round-trip completes.
+
+Concurrency: the dialogue turn (lock + session.turn + adapter I/O + save) is
+blocking sync code and runs in a worker thread via anyio.to_thread, so a
+slow DB never stalls the event loop. `Generation.cancel` is a single
+GIL-atomic flag store, safe to flip from the loop thread mid-turn.
 """
 from __future__ import annotations
 
 import re
 import time
 
+import anyio.to_thread
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.booking_service import DialogueSession
 from domain.errors import UnknownIdentity
+from domain.models import PatientRef
 from identity.providers import IdentityContext
+from sessions.locks import patient_turn_lock
 from voice.runtime import VoiceRuntime
 
 router = APIRouter()
@@ -62,7 +70,6 @@ async def voice_ws(ws: WebSocket) -> None:
     await ws.accept(subprotocol=PROTOCOL)
     session: DialogueSession = ws.app.state.session_factory(patient)
     runtime = VoiceRuntime(session)
-    snapshots = ws.app.state.snapshots
     try:
         while True:
             msg = await ws.receive_json()
@@ -74,26 +81,32 @@ async def voice_ws(ws: WebSocket) -> None:
                 gen = runtime.current.gen_id if runtime.current else None
                 await ws.send_json({"type": "stopped", "gen_id": gen})
             elif kind == "user_text":
-                text = str(msg.get("text", ""))
-                t0 = time.monotonic()
-                speech, gen = runtime.on_user_text(text)
-                t_ms = int((time.monotonic() - t0) * 1000)
-                snapshots.save(session.state)
-                if gen.cancelled or not speech:
-                    await ws.send_json({"type": "superseded", "gen_id": gen.gen_id})
-                else:
-                    await ws.send_json(
-                        {
-                            "type": "speech",
-                            "gen_id": gen.gen_id,
-                            "text": speech,
-                            "phase": session.state.phase.value,
-                            "flow": session.state.flow.value,
-                            "booking_id": session.state.active_booking_id,
-                            "t_ms": t_ms,
-                        }
-                    )
+                reply = await anyio.to_thread.run_sync(
+                    _do_turn, ws.app.state, patient, runtime, session, str(msg.get("text", ""))
+                )
+                await ws.send_json(reply)
             else:
                 await ws.send_json({"type": "error", "detail": f"unknown: {kind}"})
     except WebSocketDisconnect:
         return
+
+
+def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime,
+             session: DialogueSession, text: str) -> dict:
+    """One blocking dialogue turn: lock -> turn -> save. Runs in a worker thread."""
+    t0 = time.monotonic()
+    with patient_turn_lock(app_state.redis_url, patient.patient_id):
+        speech, gen = runtime.on_user_text(text)
+        t_ms = int((time.monotonic() - t0) * 1000)
+        app_state.snapshots.save(session.state)
+    if gen.cancelled or not speech:
+        return {"type": "superseded", "gen_id": gen.gen_id}
+    return {
+        "type": "speech",
+        "gen_id": gen.gen_id,
+        "text": speech,
+        "phase": session.state.phase.value,
+        "flow": session.state.flow.value,
+        "booking_id": session.state.active_booking_id,
+        "t_ms": t_ms,
+    }

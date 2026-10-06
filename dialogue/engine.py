@@ -16,6 +16,7 @@ from datetime import datetime
 from clinic_adapter.base import ClinicAdapter
 from dialogue import renderer
 from dialogue.state import DialogueState, Flow, Phase
+from domain.adapter_errors import AdapterUnavailable
 from domain.commands import CreateAppointmentCommand, RescheduleCommand
 from domain.errors import SlotUnavailable
 from domain.models import Specialty
@@ -82,7 +83,17 @@ def step(
         Intent.CORRECT: _on_correct,
         Intent.UNKNOWN: _on_unknown,
     }[nlu.intent]
-    return handler(state, nlu, adapter, ctx)
+    try:
+        return handler(state, nlu, adapter, ctx)
+    except AdapterUnavailable:
+        # Fail-safe: backend pain never becomes an invented slot or booking.
+        # No state committed by the failed call; the turn stays retryable.
+        from observability import metrics
+
+        ctx.trace.log("adapter_unavailable")
+        metrics.inc("fallbacks_total")
+        state.phase = Phase.ELICIT
+        return state, renderer.temporarily_unavailable()
 
 
 def _on_book(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: TurnCtx):

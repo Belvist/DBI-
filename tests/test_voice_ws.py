@@ -62,11 +62,8 @@ def test_ws_barge_in_cancels_generation():
         ws.send_json({"type": "barge_in"})
         ack = ws.receive_json()
         assert ack["type"] == "stopped"
-        kinds = [
-            e.kind
-            for e in api_main._SESSIONS["demo-patient"].trace.events
-        ]
-        assert "barge_in" in kinds
+        sess = api_main._session(PatientRef(patient_id="demo-patient"))
+        assert "barge_in" in [e.kind for e in sess.trace.events]
 
 
 def test_ws_unknown_message():
