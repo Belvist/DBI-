@@ -143,8 +143,17 @@ class MockSqliteClinic:
             for r in rows
         ]
         if name_query:
-            nq = name_query.lower()
-            out = [d for d in out if nq in d.full_name.lower() or nq in d.short_name.lower()]
+            # NLU currently supplies a surname stem ("иванов", "петров").
+            # Match it against the surname token only; substring search across
+            # the whole FIO makes "иванов" incorrectly match patronymics such
+            # as "Ивановна".
+            nq = name_query.lower().strip()
+            matched: list[Doctor] = []
+            for doctor in out:
+                surname = doctor.full_name.split()[0].lower()
+                if surname.startswith(nq) or nq.startswith(surname):
+                    matched.append(doctor)
+            out = matched
         return sorted(out, key=lambda d: d.doctor_id)
 
     def _row_to_swd(self, r: sqlite3.Row) -> SlotWithDoctor:
