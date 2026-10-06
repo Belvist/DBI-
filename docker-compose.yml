@@ -21,10 +21,10 @@ services:
       db:
         condition: service_healthy
       cache:
-        condition: service_started
+        condition: service_healthy
     profiles: ["full"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready')"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -39,7 +39,7 @@ services:
       DBI_IDENTITY: demo
     profiles: ["lite"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready')"]
       interval: 10s
       timeout: 5s
       retries: 10

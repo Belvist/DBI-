@@ -98,13 +98,28 @@ class SessionStore:
         try:
             payload = json.loads(row[0])
             if payload.get("v") not in (1, SNAPSHOT_VERSION):
+                self._quarantine(patient_id, "foreign version")
                 return None
             state = DialogueState(**payload["state"])
             state.revision = payload.get("revision", row[1] or 0)
             return state
         except Exception as e:
             log.warning("ignoring corrupt snapshot for %s: %s", patient_id, e)
+            self._quarantine(patient_id, "corrupt payload")
             return None
+
+    def _quarantine(self, patient_id: str, reason: str) -> None:
+        """Delete an unreadable record so the next save starts clean at
+        revision 0 instead of wedging on undecodable state forever."""
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "DELETE FROM snapshots WHERE patient_id=?", (patient_id,)
+                )
+                self._conn.commit()
+            log.warning("quarantined %s snapshot for %s", reason, patient_id)
+        except sqlite3.Error as e:
+            log.error("quarantine failed for %s: %s", patient_id, e)
 
     def drop(self, patient_id: str) -> None:
         with self._lock:

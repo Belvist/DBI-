@@ -23,6 +23,7 @@ class Settings:
     redis_url: str
     single_replica: bool
     metrics_token: str
+    clock_override: str
     allow_seed: bool
 
 
@@ -78,6 +79,7 @@ def load(env: dict[str, str] | None = None) -> Settings:
         sessions_path=src.get("DBI_SESSIONS_PATH", ":memory:"),
         redis_url=redis_url,
         single_replica=single_replica,
+        clock_override=src.get("DBI_CLOCK", ""),
         metrics_token=metrics_token,
         allow_seed=allow_seed,
     )

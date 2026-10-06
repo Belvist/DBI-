@@ -113,7 +113,7 @@ def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime, text: str) -
             adapter=runtime.session.adapter,
             snapshots=app_state.snapshots,
             redis_url=app_state.redis_url,
-            now=runtime.session.now,
+            now=app_state.clock.now(),
         )
     except StaleState:
         return {"type": "error", "detail": "concurrent turn, please repeat"}

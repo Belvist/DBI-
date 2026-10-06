@@ -81,13 +81,22 @@ class RedisSessionStore:
         try:
             payload = json.loads(raw)
             if payload.get("v") not in (1, SNAPSHOT_VERSION):
+                self._quarantine(patient_id, "foreign version")
                 return None
             state = DialogueState(**payload["state"])
             state.revision = payload.get("revision", 0)
             return state
         except Exception as e:
             log.warning("ignoring corrupt snapshot for %s: %s", patient_id, e)
+            self._quarantine(patient_id, "corrupt payload")
             return None
+
+    def _quarantine(self, patient_id: str, reason: str) -> None:
+        try:
+            self._redis.delete(self._key(patient_id))
+            log.warning("quarantined %s snapshot for %s", reason, patient_id)
+        except Exception as e:
+            log.error("quarantine failed for %s: %s", patient_id, e)
 
     def drop(self, patient_id: str) -> None:
         import redis

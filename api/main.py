@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -18,6 +17,7 @@ from domain.models import PatientRef
 from identity.deps import identify_patient, require_scope
 from identity.providers import resolve_provider
 from observability import metrics
+from observability.clock import resolve_clock
 from sessions.coordinator import run_turn
 from sessions.store import SessionStore
 from voice.stt import BrowserSTT
@@ -47,7 +47,8 @@ if _SETTINGS.redis_url:
 else:
     _SNAPSHOTS = SessionStore(path=_SETTINGS.sessions_path)
     log.info("snapshots=sqlite path=%s", _SETTINGS.sessions_path)
-_DEMO_NOW = datetime(2026, 10, 13, 12, 0)
+_CLOCK = resolve_clock(_SETTINGS.env, _SETTINGS.clock_override)
+log.info("clock=%s", type(_CLOCK).__name__)
 _STT = BrowserSTT()
 _TTS = BrowserTTS()
 
@@ -55,7 +56,7 @@ _TTS = BrowserTTS()
 def _session(patient: PatientRef) -> DialogueSession:
     # Fresh build from the authoritative snapshot on every call: no process
     # ever trusts a cached DialogueSession across turns (see coordinator).
-    sess = DialogueSession(patient, _ADAPTER, now=_DEMO_NOW)
+    sess = DialogueSession(patient, _ADAPTER, now=_CLOCK.now())
     restored = _SNAPSHOTS.load(patient.patient_id)
     if restored is not None and restored.patient.patient_id == patient.patient_id:
         sess.state = restored
@@ -76,7 +77,7 @@ def _turn_locked(
             adapter=_ADAPTER,
             snapshots=_SNAPSHOTS,
             redis_url=_SETTINGS.redis_url,
-            now=_DEMO_NOW,
+            now=_CLOCK.now(),
         )
     except StaleState as e:
         raise HTTPException(status_code=409, detail=f"concurrent turn: {e}") from None
@@ -93,6 +94,7 @@ app.state.session_factory = _session
 app.state.identity = _IDENTITY
 app.state.snapshots = _SNAPSHOTS
 app.state.redis_url = _SETTINGS.redis_url
+app.state.clock = _CLOCK
 app.state.base_adapter = _BASE
 
 
@@ -198,10 +200,12 @@ def dialogue_turn(
 
 @app.get("/voice", response_class=HTMLResponse)
 def voice_client():
-    from pathlib import Path
+    # importlib.resources: works from a wheel install where no source
+    # checkout exists next to the package.
+    from importlib.resources import files
 
-    page = Path(__file__).resolve().parent.parent / "voice" / "web" / "index.html"
-    return HTMLResponse(page.read_text(encoding="utf-8"))
+    page = files("voice").joinpath("web/index.html").read_text(encoding="utf-8")
+    return HTMLResponse(page)
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -39,6 +39,7 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 clinic_adapter = ["migrations/*.sql"]
+voice = ["web/*.html"]
 
 [tool.ruff]
 line-length = 100
