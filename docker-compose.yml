@@ -1,0 +1,14 @@
+name: dbi
+services:
+  api:
+    build: .
+    container_name: dbi-api
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DBI_DB_PATH: /tmp/dbi.sqlite
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

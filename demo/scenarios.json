@@ -1,0 +1,16 @@
+[
+  {"id": "BOOK_exact_doctor", "turns": ["Хочу записаться к Иванову на следующей неделе"], "assert": "propose_or_confirm"},
+  {"id": "BOOK_specialty_only", "turns": ["Хочу записаться к неврологу"], "assert": "ask_day"},
+  {"id": "BOOK_next_week_evening", "turns": ["Запиши меня к кардиологу на следующей неделе вечером"], "assert": "propose_evening"},
+  {"id": "BOOK_no_slots", "turns": ["Запиши меня к дерматологу 1 января"], "assert": "no_slots_or_ask"},
+  {"id": "BOOK_race_before_commit", "turns": ["__BOOK_THEN_STEAL__"], "assert": "race_recovery"},
+  {"id": "GET_STATUS", "turns": ["__BOOK_ONE__", "Когда я записан?"], "assert": "status_lists_booking"},
+  {"id": "RESCHEDULE", "turns": ["__BOOK_ONE__", "Не смогу. Давай в четверг утром"], "assert": "reschedule_propose"},
+  {"id": "RESCHEDULE_no_alternatives", "turns": ["__BOOK_ONE__", "Перенеси на 1 января"], "assert": "no_slots_or_ask"},
+  {"id": "GET_SCHEDULE", "turns": ["Кто принимает на следующей неделе?"], "assert": "propose_or_list"},
+  {"id": "DENY_confirmation", "turns": ["__PROPOSE__", "Нет, вторник вообще не могу"], "assert": "re_elicit"},
+  {"id": "CORRECTION_wed_thu", "turns": ["Запиши к неврологу в среду", "Не среда, четверг"], "assert": "propose Thursday"},
+  {"id": "AMBIGUOUS_date", "turns": ["Запиши меня к врачу"], "assert": "ask_clarify"},
+  {"id": "UNKNOWN_doctor", "turns": ["Запиши меня к астрологу"], "assert": "ask_clarify"},
+  {"id": "DUPLICATE_commit", "turns": ["__BOOK_WITH_FIXED_IK__", "__BOOK_WITH_FIXED_IK__"], "assert": "single_booking"}
+]

@@ -1,0 +1,26 @@
+[project]
+name = "dbi-assistant"
+version = "0.1.0"
+description = "DBI voice clinic administrator — deterministic booking core, voice is a thin layer"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Naive wall-time datetimes are intentional (hackathon scope, Europe/Moscow);
+# tz conversion lives in the DBI adapter, never in domain logic.
+ignore = ["DTZ001", "DTZ005", "DTZ007", "BLE001", "S110"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
