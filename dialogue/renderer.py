@@ -1,9 +1,4 @@
-"""Grounded renderer — speaks ONLY backend-returned facts.
-
-Rule enforced by validator: any slot datetime / booking_id in the text must
-exist in the supplied allow-list, otherwise the turn is replaced by a safe
-fallback. The engine never interpolates LLM prose into confirmations.
-"""
+"""Grounded renderer — speaks ONLY backend-returned facts."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -30,11 +25,17 @@ def fmt_slot(s: SlotWithDoctor) -> str:
 
 
 def ask_specialty() -> str:
-    return "Здравствуйте! К какому специалисту хотите записаться? Например: кардиолог, невролог, терапевт."
+    return (
+        "Здравствуйте! К какому специалисту хотите записаться? "
+        "Например: кардиолог, невролог, терапевт."
+    )
 
 
 def ask_day() -> str:
-    return "Подскажите, какой день вам удобен? Можно сказать «на следующей неделе вечером» или назвать дату."
+    return (
+        "Подскажите, какой день вам удобен? Можно сказать "
+        "«на следующей неделе вечером» или назвать дату."
+    )
 
 
 def propose_slots(slots: list[SlotWithDoctor]) -> str:
@@ -44,8 +45,8 @@ def propose_slots(slots: list[SlotWithDoctor]) -> str:
 
 def confirm_slot(s: SlotWithDoctor) -> str:
     return (
-        f"Записываю вас к {s.doctor.full_name} на {fmt_dt(s.slot.start)}. "
-        "Всё верно? Скажите «да» для подтверждения."
+        f"Вы выбрали {s.doctor.full_name}, {fmt_dt(s.slot.start)}. "
+        "Подтвердить запись? Скажите «да»."
     )
 
 
@@ -58,15 +59,43 @@ def booked(appt: Appointment, doctor: Doctor) -> str:
 
 def status_list(items: list[tuple[Appointment, Doctor]]) -> str:
     if not items:
-        return "У вас нет активных записей. Хотите записаться?"
-    parts = [f"{fmt_dt(a.start)} — {d.full_name} (№{a.booking_id})" for a, d in items]
+        return "У вас нет подходящих активных записей. Хотите записаться?"
+    parts = [
+        f"{fmt_dt(a.start)} — {d.full_name} (№{a.booking_id})"
+        for a, d in items
+    ]
     return "Ваши записи:\n" + "\n".join(parts)
 
 
 def moved(appt: Appointment, doctor: Doctor) -> str:
     return (
-        f"Перенесла запись на {fmt_dt(appt.start)} к {doctor.full_name}. "
+        f"Готово. Запись перенесена на {fmt_dt(appt.start)} к {doctor.full_name}. "
         f"Новый номер {appt.booking_id}."
+    )
+
+
+def unknown_doctor(query: str) -> str:
+    return (
+        f"Не нашла врача по запросу «{query}». "
+        "Назовите фамилию ещё раз или укажите специальность."
+    )
+
+
+def ambiguous_doctor(doctors: list[Doctor]) -> str:
+    names = ", ".join(d.full_name for d in doctors[:3])
+    return f"Нашла несколько врачей: {names}. Уточните, кого вы имеете в виду."
+
+
+def choose_booking(items: list[tuple[Appointment, Doctor]]) -> str:
+    if not items:
+        return "Не нашла активную запись для переноса."
+    lines = [
+        f"{i + 1}. {d.full_name}, {fmt_dt(a.start)}, №{a.booking_id}"
+        for i, (a, d) in enumerate(items[:3])
+    ]
+    return (
+        "У вас несколько активных записей. Уточните, какую переносим:\n"
+        + "\n".join(lines)
     )
 
 
@@ -75,7 +104,10 @@ def race_taken() -> str:
 
 
 def no_slots() -> str:
-    return "К сожалению, на эти даты свободного времени нет. Подсказать ближайшие другие дни?"
+    return (
+        "К сожалению, на эти даты свободного времени нет. "
+        "Подсказать ближайшие другие дни?"
+    )
 
 
 def unknown() -> str:
