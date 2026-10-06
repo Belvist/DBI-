@@ -179,7 +179,12 @@ def dialogue_turn(
         if e.status_code in (401, 403):
             metrics.inc("auth_failures_total")
         raise
-    speech, sess = _turn_locked(patient, inp.text, inp.idempotency_key)
+    from domain.errors import IdempotencyConflict
+
+    try:
+        speech, sess = _turn_locked(patient, inp.text, inp.idempotency_key)
+    except IdempotencyConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
     return {
         "speech": speech,
         "phase": sess.state.phase.value,

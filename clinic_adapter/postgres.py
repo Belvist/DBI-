@@ -27,6 +27,7 @@ from clinic_adapter.seed_data import ts as _s
 from domain.commands import CreateAppointmentCommand, RescheduleCommand
 from domain.errors import (
     AppointmentNotFound,
+    IdempotencyConflict,
     NotConfigured,
     SlotNotFound,
     SlotUnavailable,
@@ -216,17 +217,42 @@ class PostgresClinic:
         )
 
     # ---------- WRITE (atomic, cross-process safe) ----------
-    def _by_key(self, cur, key: str) -> dict | None:
-        cur.execute("SELECT * FROM appointments WHERE idempotency_key=%s", (key,))
+    # Idempotency is scoped by (patient_id, operation_kind, key): one
+    # patient's key never aliases another patient's booking, and a key
+    # reused for a different payload raises IdempotencyConflict (409).
+    def _find_op(self, cur, patient_id: str, kind: str, key: str) -> dict | None:
+        cur.execute(
+            "SELECT * FROM idempotency_operations"
+            " WHERE patient_id=%s AND operation_kind=%s AND idempotency_key=%s",
+            (patient_id, kind, key),
+        )
         return cur.fetchone()
 
+    def _booking_by_id(self, cur, booking_id: str) -> Appointment:
+        cur.execute("SELECT * FROM appointments WHERE booking_id=%s", (booking_id,))
+        return self._to_appt(cur.fetchone())
+
+    def _resolve_op(self, cur, patient_id: str, kind: str, key: str, fp: str) -> Appointment:
+        op = self._find_op(cur, patient_id, kind, key)
+        if op is None:
+            raise AssertionError("op row vanished mid-race")
+        if op["request_hash"] != fp:
+            raise IdempotencyConflict(
+                f"key {key!r} already used for a different {kind} operation"
+            )
+        return self._booking_by_id(cur, op["result_booking_id"])
+
     def create_appointment(self, cmd: CreateAppointmentCommand) -> Appointment:
+        from clinic_adapter.idempotency import fingerprint_create
+
         booking_id = "A" + uuid.uuid4().hex[:6].upper()
         now = _s(datetime.now().replace(second=0, microsecond=0))
+        fp = fingerprint_create(cmd)
+        pid = cmd.patient.patient_id
         try:
             with self._pool.connection() as conn, conn.cursor() as cur, conn.transaction():
-                if (row := self._by_key(cur, cmd.idempotency_key)) is not None:
-                    return self._to_appt(row)
+                if self._find_op(cur, pid, "create", cmd.idempotency_key) is not None:
+                    return self._resolve_op(cur, pid, "create", cmd.idempotency_key, fp)
                 cur.execute(
                     "SELECT slot_id, doctor_id, start_ts, end_ts, taken_by"
                     " FROM slots WHERE slot_id=%s FOR UPDATE",
@@ -243,22 +269,27 @@ class PostgresClinic:
                                 start_ts, end_ts, status, idempotency_key, created_at)
                                VALUES(%s,%s,%s,%s,%s,%s,'active',%s,%s)""",
                     (
-                        booking_id, cmd.patient.patient_id, s["doctor_id"],
+                        booking_id, pid, s["doctor_id"],
                         s["slot_id"], s["start_ts"], s["end_ts"],
                         cmd.idempotency_key, now,
                     ),
                 )
                 cur.execute(
+                    """INSERT INTO idempotency_operations
+                       (patient_id, operation_kind, idempotency_key,
+                        request_hash, result_booking_id, created_at)
+                       VALUES(%s,'create',%s,%s,%s,%s)""",
+                    (pid, cmd.idempotency_key, fp, booking_id, now),
+                )
+                cur.execute(
                     "UPDATE slots SET taken_by=%s WHERE slot_id=%s",
-                    (cmd.patient.patient_id, cmd.slot_id),
+                    (pid, cmd.slot_id),
                 )
         except psycopg.errors.UniqueViolation:
-            # Lost a cross-process insert race on idempotency_key: the winner's
-            # row is the truth — return it instead of a duplicate.
+            # Lost a cross-process insert race: the winner's op row is the
+            # truth — resolve it (or conflict on payload mismatch).
             with self._pool.connection() as conn, conn.cursor() as cur:
-                row = self._by_key(cur, cmd.idempotency_key)
-                assert row is not None
-                return self._to_appt(row)
+                return self._resolve_op(cur, pid, "create", cmd.idempotency_key, fp)
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM appointments WHERE booking_id=%s", (booking_id,)
@@ -266,16 +297,20 @@ class PostgresClinic:
             return self._to_appt(cur.fetchone())
 
     def reschedule_appointment(self, cmd: RescheduleCommand) -> Appointment:
+        from clinic_adapter.idempotency import fingerprint_reschedule
+
         new_id = "A" + uuid.uuid4().hex[:6].upper()
         now = _s(datetime.now().replace(second=0, microsecond=0))
+        fp = fingerprint_reschedule(cmd)
+        pid = cmd.patient.patient_id
         try:
             with self._pool.connection() as conn, conn.cursor() as cur, conn.transaction():
-                if (row := self._by_key(cur, cmd.idempotency_key)) is not None:
-                    return self._to_appt(row)
+                if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                    return self._resolve_op(cur, pid, "reschedule", cmd.idempotency_key, fp)
                 cur.execute(
                     "SELECT * FROM appointments WHERE booking_id=%s"
                     " AND patient_id=%s FOR UPDATE",
-                    (cmd.booking_id, cmd.patient.patient_id),
+                    (cmd.booking_id, pid),
                 )
                 old = cur.fetchone()
                 if old is None or old["status"] != AppointmentStatus.ACTIVE.value:
@@ -298,7 +333,7 @@ class PostgresClinic:
                 )
                 cur.execute(
                     "UPDATE slots SET taken_by=%s WHERE slot_id=%s",
-                    (cmd.patient.patient_id, cmd.new_slot_id),
+                    (pid, cmd.new_slot_id),
                 )
                 cur.execute(
                     "UPDATE appointments SET status='moved' WHERE booking_id=%s",
@@ -310,16 +345,21 @@ class PostgresClinic:
                                 start_ts, end_ts, status, idempotency_key, created_at)
                                VALUES(%s,%s,%s,%s,%s,%s,'active',%s,%s)""",
                     (
-                        new_id, cmd.patient.patient_id, tgt["doctor_id"],
+                        new_id, pid, tgt["doctor_id"],
                         tgt["slot_id"], tgt["start_ts"], tgt["end_ts"],
                         cmd.idempotency_key, now,
                     ),
                 )
+                cur.execute(
+                    """INSERT INTO idempotency_operations
+                       (patient_id, operation_kind, idempotency_key,
+                        request_hash, result_booking_id, created_at)
+                       VALUES(%s,'reschedule',%s,%s,%s,%s)""",
+                    (pid, cmd.idempotency_key, fp, new_id, now),
+                )
         except psycopg.errors.UniqueViolation:
             with self._pool.connection() as conn, conn.cursor() as cur:
-                row = self._by_key(cur, cmd.idempotency_key)
-                assert row is not None
-                return self._to_appt(row)
+                return self._resolve_op(cur, pid, "reschedule", cmd.idempotency_key, fp)
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT * FROM appointments WHERE booking_id=%s", (new_id,)
@@ -327,23 +367,23 @@ class PostgresClinic:
             return self._to_appt(cur.fetchone())
 
     def purge_stale_idempotency_keys(self, older_than_days: int = 30) -> int:
+        """Delete op rows whose result booking is non-active and old.
+
+        ACTIVE bookings are never touched: a late retry must still dedup.
+        """
         cutoff = _s(datetime.now() - timedelta(days=older_than_days))
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT booking_id FROM appointments
-                       WHERE status != 'active' AND created_at < %s
-                       AND idempotency_key NOT LIKE 'purged:%%'""",
+                    """DELETE FROM idempotency_operations WHERE result_booking_id IN (
+                         SELECT booking_id FROM appointments
+                         WHERE status != 'active' AND created_at < %s
+                       )""",
                     (cutoff,),
                 )
-                ids = [r["booking_id"] for r in cur.fetchall()]
-                for bid in ids:
-                    cur.execute(
-                        "UPDATE appointments SET idempotency_key=%s WHERE booking_id=%s",
-                        (f"purged:{bid}", bid),
-                    )
+                n = cur.rowcount
             conn.commit()
-            return len(ids)
+            return n
 
     def steal_slot(self, slot_id: str, by: str = "other_patient") -> None:
         with self._pool.connection() as conn:

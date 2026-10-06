@@ -40,7 +40,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.booking_service import DialogueSession
 from domain.adapter_errors import DependencyUnavailable
-from domain.errors import UnknownIdentity
+from domain.errors import IdempotencyConflict, UnknownIdentity
 from domain.models import PatientRef
 from identity.providers import IdentityContext
 from sessions.coordinator import run_turn
@@ -119,6 +119,8 @@ def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime, text: str) -
         return {"type": "error", "detail": "concurrent turn, please repeat"}
     except DependencyUnavailable:
         return {"type": "error", "detail": "service temporarily unavailable, please retry"}
+    except IdempotencyConflict:
+        return {"type": "error", "detail": "operation key conflict, use a fresh key"}
     runtime.session = sess  # rebind: barge-in trace follows the latest session
     runtime.trace = sess.trace
     t_ms = int((time.monotonic() - t0) * 1000)

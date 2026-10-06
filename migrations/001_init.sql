@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS appointments(
   start_ts TEXT NOT NULL,
   end_ts TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
-  idempotency_key TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slots_doc_start ON slots(doctor_id, start_ts);
