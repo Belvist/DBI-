@@ -15,9 +15,14 @@ from dataclasses import dataclass, field
 from domain.adapter_errors import AdapterUnavailable
 from domain.errors import SlotUnavailable
 
+try:
+    from psycopg_pool.errors import PoolTimeout
+except ImportError:  # pragma: no cover - pool is a hard dep, belt and braces
+    PoolTimeout = ()  # type: ignore[assignment,misc]
+
 
 def is_transient(exc: BaseException) -> bool:
-    if isinstance(exc, (ConnectionError, TimeoutError)):
+    if isinstance(exc, (ConnectionError, TimeoutError, PoolTimeout)):
         return True
     name = type(exc).__name__
     mod = type(exc).__module__

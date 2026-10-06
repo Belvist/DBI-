@@ -26,6 +26,10 @@ class ResilientAdapter:
     def breaker(self) -> CircuitBreaker:
         return self._breaker
 
+    def ping(self) -> None:
+        # Direct probe: health checks must not trip the breaker or metrics.
+        self._base.ping()
+
     # ---- READ ----
     def find_doctors(
         self,

@@ -29,6 +29,10 @@ class TurnCtx:
     now: datetime
     trace: Trace
     idempotency_key: str = field(default_factory=lambda: "ik-" + uuid.uuid4().hex[:12])
+    # True when the caller supplied idempotency_key explicitly (API contract).
+    # An explicit key always wins over a pending one; otherwise the pending
+    # operation's key is reused so unknown-WRITE retries dedup server-side.
+    idempotency_key_explicit: bool = False
 
 
 def _spec(s: str | None) -> Specialty | None:
@@ -314,11 +318,23 @@ def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ct
 def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
     assert state.selected_slot_id
     state.phase = Phase.COMMIT
-    # Retry of an unknown WRITE reuses the SAME idempotency_key so the
-    # backend dedups instead of double-booking. A fresh TurnCtx key is only
-    # used when no operation is pending.
+    # Key precedence: an explicitly supplied caller key always wins (and
+    # rebinds the pending operation to it); otherwise a pending operation's
+    # key is reused so unknown-WRITE retries dedup server-side; only with
+    # neither do we fall back to this turn's generated key.
     pending = state.pending_operation
-    key = pending.idempotency_key if pending is not None else ctx.idempotency_key
+    if ctx.idempotency_key_explicit:
+        key = ctx.idempotency_key
+        state.pending_operation = PendingOperation(
+            idempotency_key=key,
+            kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
+            booking_id=state.active_booking_id,
+            slot_id=state.selected_slot_id,
+        )
+    elif pending is not None:
+        key = pending.idempotency_key
+    else:
+        key = ctx.idempotency_key
     try:
         if state.flow == Flow.RESCHEDULE and state.active_booking_id:
             appt = adapter.reschedule_appointment(
@@ -365,8 +381,6 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
         # Keep the selected slot as well: if the retry hits a taken slot,
         # SlotUnavailable recovers via re-search instead of double-booking.
         from observability import metrics
-
-        from dialogue.state import PendingOperation
 
         ctx.trace.log("commit_outcome_unknown", slot=state.selected_slot_id)
         metrics.inc("fallbacks_total")

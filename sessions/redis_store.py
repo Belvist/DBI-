@@ -10,6 +10,7 @@ import json
 import logging
 
 from dialogue.state import DialogueState
+from domain.adapter_errors import DependencyUnavailable
 from sessions.errors import StaleState
 from sessions.store import SNAPSHOT_VERSION
 
@@ -45,23 +46,33 @@ class RedisSessionStore:
 
     def save(self, state: DialogueState) -> int:
         """CAS-save. Returns the new revision; raises StaleState on conflict."""
+        import redis
+
         new_revision = state.revision + 1
         payload = json.dumps(
             {"v": SNAPSHOT_VERSION, "revision": new_revision,
              "state": state.model_dump(mode="json")},
             ensure_ascii=False,
         )
-        result = self._cas(
-            keys=[self._key(state.patient.patient_id)],
-            args=[state.revision, payload, self._ttl],
-        )
+        try:
+            result = self._cas(
+                keys=[self._key(state.patient.patient_id)],
+                args=[state.revision, payload, self._ttl],
+            )
+        except redis.RedisError as e:
+            raise DependencyUnavailable(f"snapshot save failed: {e}") from e
         if int(result) < 0:
             raise StaleState(state.patient.patient_id)
         state.revision = new_revision
         return new_revision
 
     def load(self, patient_id: str):
-        raw = self._redis.get(self._key(patient_id))
+        import redis
+
+        try:
+            raw = self._redis.get(self._key(patient_id))
+        except redis.RedisError as e:
+            raise DependencyUnavailable(f"snapshot load failed: {e}") from e
         if raw is None:
             return None
         try:
@@ -76,7 +87,17 @@ class RedisSessionStore:
             return None
 
     def drop(self, patient_id: str) -> None:
-        self._redis.delete(self._key(patient_id))
+        import redis
+
+        try:
+            self._redis.delete(self._key(patient_id))
+        except redis.RedisError as e:
+            raise DependencyUnavailable(f"snapshot drop failed: {e}") from e
 
     def ping(self) -> None:
-        self._redis.ping()
+        import redis
+
+        try:
+            self._redis.ping()
+        except redis.RedisError as e:
+            raise DependencyUnavailable(f"snapshot ping failed: {e}") from e

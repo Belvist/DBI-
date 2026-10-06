@@ -78,6 +78,8 @@ function onServerMessage(ev) {
     sys("Ход отменён перебиванием (" + m.gen_id + ").");
   } else if (m.type === "stopped") {
     sys("Остановлено (" + m.gen_id + "). Слушаю…");
+  } else if (m.type === "error") {
+    sys("Ошибка: " + m.detail);
   }
 }
 

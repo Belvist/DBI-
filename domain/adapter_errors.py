@@ -8,3 +8,11 @@ class AdapterUnavailable(Exception):
     The dialogue answers with a safe fallback instead of inventing facts.
     Never carries slot or booking details.
     """
+
+
+class DependencyUnavailable(Exception):
+    """A platform dependency (Redis, pool, snapshot store) failed.
+
+    Maps to HTTP 503 / a controlled WS error — never to a 500 with a
+    traceback, and never to invented dialogue facts.
+    """

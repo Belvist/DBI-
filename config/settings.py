@@ -22,6 +22,7 @@ class Settings:
     sessions_path: str
     redis_url: str
     single_replica: bool
+    metrics_token: str
     allow_seed: bool
 
 
@@ -72,5 +73,6 @@ def load(env: dict[str, str] | None = None) -> Settings:
         sessions_path=src.get("DBI_SESSIONS_PATH", ":memory:"),
         redis_url=redis_url,
         single_replica=single_replica,
+        metrics_token=src.get("DBI_METRICS_TOKEN", ""),
         allow_seed=allow_seed,
     )

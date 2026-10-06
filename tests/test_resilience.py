@@ -255,7 +255,32 @@ def test_metrics_endpoint_lists_counters():
 
 def test_ready_ok_with_live_backend():
     r = client.get("/ready")
-    assert r.status_code == 200 and r.json()["status"] == "ready"
+    assert r.status_code == 200 and r.json() == {"status": "ready"}
+
+
+def test_pool_timeout_maps_to_unavailable_not_raw():
+    from psycopg_pool.errors import PoolTimeout
+
+    breaker = CircuitBreaker(fail_threshold=10)
+    try:
+        call_guarded(breaker, Flaky(5, PoolTimeout("pool exhausted")), attempts=2)
+        raise AssertionError("must raise")
+    except AdapterUnavailable:
+        pass
+
+
+def test_metrics_token_gates_endpoint(monkeypatch):
+    import dataclasses
+
+    import api.main as api_main
+
+    monkeypatch.setattr(
+        api_main, "_SETTINGS", dataclasses.replace(api_main._SETTINGS, metrics_token="s3cr3t")
+    )
+    assert client.get("/metrics").status_code == 404
+    assert client.get("/metrics", headers={"X-Metrics-Token": "wrong"}).status_code == 404
+    r = client.get("/metrics", headers={"X-Metrics-Token": "s3cr3t"})
+    assert r.status_code == 200 and "dbi_" in r.text
 
 
 def test_ready_503_when_backend_down(monkeypatch):

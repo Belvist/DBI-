@@ -38,7 +38,17 @@
 ## Fail-safe исходы
 
 - READ-упал → «ничего не записано и не изменено» (честно: мутаций не было).
-- WRITE-упал → «не удалось подтвердить, могла сохраниться» + ретрай бьёт
-  в ТОТ ЖЕ слот: взятый слот даёт SlotUnavailable → re-search, дубля нет.
+- WRITE-упал → «не удалось подтвердить, могла сохраниться». Операция уже
+  имеет durable identity (`pending_operation` создаётся при CONFIRM-выборе):
+  ретрай переиспользует ТОТ ЖЕ `idempotency_key`, backend возвращает
+  исходную запись. Явно переданный ключ API всегда побеждает pending.
 - Production требует `DBI_PG_URL` всегда и Redis либо `DBI_SINGLE_REPLICA=1.
 - Миграции сериализованы advisory lock; `/ready` проверяет и Redis.
+
+## State authority (реплики)
+
+Локальный `DialogueSession` больше не источник истины: каждый ход идёт
+`lock → load latest → turn → CAS save → unlock` (`sessions/coordinator.py`).
+Конфликт ревизий → `StaleState` → 409/WS-error, перезаписи нет.
+Потеря lease heartbeat'ом видна через `lease.lost`, но решает CAS.
+`/metrics` за `DBI_METRICS_TOKEN` (иначе 404); `/ready` отдаёт только статус.

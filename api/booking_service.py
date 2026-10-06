@@ -42,6 +42,7 @@ class DialogueSession:
         ctx = TurnCtx(now=self.now, trace=self.trace)
         if idempotency_key:
             ctx.idempotency_key = idempotency_key
+            ctx.idempotency_key_explicit = True
         self.state, speech = step(self.state, fused, self.adapter, ctx)
         self._refresh_allowlist()
         ok, safe = validate(speech, self._allowed_dts, self._allowed_bids)

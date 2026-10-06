@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 
 from dialogue.state import DialogueState
+from domain.adapter_errors import DependencyUnavailable
 from sessions.errors import StaleState
 
 log = logging.getLogger("dbi.sessions")
@@ -52,39 +53,46 @@ class SessionStore:
              "state": state.model_dump(mode="json")},
             ensure_ascii=False,
         )
-        with self._lock:
-            if state.revision == 0:
-                # Check if row exists first - if it does, our base is stale
-                existing = self._conn.execute(
-                    "SELECT revision FROM snapshots WHERE patient_id=?",
-                    (state.patient.patient_id,),
-                ).fetchone()
-                if existing is not None:
-                    self._conn.commit()
-                    raise StaleState(state.patient.patient_id)
-                cur = self._conn.execute(
-                    """INSERT INTO snapshots(patient_id, state_json, revision, updated_at)
-                       VALUES(?, ?, ?, datetime('now'))""",
-                    (state.patient.patient_id, payload, new_revision),
-                )
-            else:
-                cur = self._conn.execute(
-                    """UPDATE snapshots SET state_json=?, revision=?, updated_at=datetime('now')
-                       WHERE patient_id=? AND revision=?""",
-                    (payload, new_revision, state.patient.patient_id, state.revision),
-                )
-                if cur.rowcount == 0:
-                    self._conn.commit()
-                    raise StaleState(state.patient.patient_id)
-            self._conn.commit()
+        try:
+            with self._lock:
+                if state.revision == 0:
+                    # Check if row exists first - if it does, our base is stale
+                    existing = self._conn.execute(
+                        "SELECT revision FROM snapshots WHERE patient_id=?",
+                        (state.patient.patient_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        self._conn.commit()
+                        raise StaleState(state.patient.patient_id)
+                    self._conn.execute(
+                        """INSERT INTO snapshots(patient_id, state_json, revision, updated_at)
+                           VALUES(?, ?, ?, datetime('now'))""",
+                        (state.patient.patient_id, payload, new_revision),
+                    )
+                else:
+                    cur = self._conn.execute(
+                        """UPDATE snapshots SET state_json=?, revision=?, updated_at=datetime('now')
+                           WHERE patient_id=? AND revision=?""",
+                        (payload, new_revision, state.patient.patient_id, state.revision),
+                    )
+                    if cur.rowcount == 0:
+                        self._conn.commit()
+                        raise StaleState(state.patient.patient_id)
+                self._conn.commit()
+        except sqlite3.Error as e:
+            raise DependencyUnavailable(f"snapshot save failed: {e}") from e
         state.revision = new_revision
         return new_revision
 
     def load(self, patient_id: str):
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT state_json, revision FROM snapshots WHERE patient_id=?", (patient_id,)
-            ).fetchone()
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT state_json, revision FROM snapshots WHERE patient_id=?",
+                    (patient_id,),
+                ).fetchone()
+        except sqlite3.Error as e:
+            raise DependencyUnavailable(f"snapshot load failed: {e}") from e
         if row is None:
             return None
         try:
@@ -104,5 +112,8 @@ class SessionStore:
             self._conn.commit()
 
     def ping(self) -> None:
-        with self._lock:
-            self._conn.execute("SELECT 1").fetchone()
+        try:
+            with self._lock:
+                self._conn.execute("SELECT 1").fetchone()
+        except sqlite3.Error as e:
+            raise DependencyUnavailable(f"snapshot ping failed: {e}") from e

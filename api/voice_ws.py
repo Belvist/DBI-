@@ -39,6 +39,7 @@ import anyio.to_thread
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.booking_service import DialogueSession
+from domain.adapter_errors import DependencyUnavailable
 from domain.errors import UnknownIdentity
 from domain.models import PatientRef
 from identity.providers import IdentityContext
@@ -116,6 +117,8 @@ def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime, text: str) -
         )
     except StaleState:
         return {"type": "error", "detail": "concurrent turn, please repeat"}
+    except DependencyUnavailable:
+        return {"type": "error", "detail": "service temporarily unavailable, please retry"}
     runtime.session = sess  # rebind: barge-in trace follows the latest session
     runtime.trace = sess.trace
     t_ms = int((time.monotonic() - t0) * 1000)

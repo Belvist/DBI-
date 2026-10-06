@@ -51,13 +51,19 @@ def patient_turn_lock(
 
     import redis
 
-    client = redis.Redis.from_url(redis_url, socket_connect_timeout=5, socket_timeout=5)
-    lock = client.lock(
-        LOCK_PREFIX + patient_id,
-        timeout=lease_s,
-        blocking_timeout=timeout_s,
-    )
-    if not lock.acquire():
+    from domain.adapter_errors import DependencyUnavailable
+
+    try:
+        client = redis.Redis.from_url(redis_url, socket_connect_timeout=5, socket_timeout=5)
+        lock = client.lock(
+            LOCK_PREFIX + patient_id,
+            timeout=lease_s,
+            blocking_timeout=timeout_s,
+        )
+        acquired = lock.acquire()
+    except redis.RedisError as e:
+        raise DependencyUnavailable(f"patient lock failed: {e}") from e
+    if not acquired:
         raise TimeoutError(f"patient lock timeout: {patient_id}")
     # NOTE: redis-py keeps the ownership token thread-local, so Lock.reacquire()
     # cannot run in the heartbeat thread. Renewal is an atomic Lua

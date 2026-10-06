@@ -65,6 +65,7 @@ def _session(patient: PatientRef) -> DialogueSession:
 def _turn_locked(
     patient: PatientRef, text: str, idempotency_key: str | None
 ) -> tuple[str, DialogueSession]:
+    from domain.adapter_errors import DependencyUnavailable
     from sessions.errors import StaleState
 
     try:
@@ -81,6 +82,8 @@ def _turn_locked(
         raise HTTPException(status_code=409, detail=f"concurrent turn: {e}") from None
     except TimeoutError as e:
         raise HTTPException(status_code=409, detail=str(e)) from None
+    except DependencyUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from None
 
 
 app.state.session_factory = _session
@@ -110,35 +113,31 @@ def health() -> dict:
 
 @app.get("/ready")
 def ready() -> dict:
-    """Readiness: adapter AND session store reachable. 503 when any is down.
-    Uses direct dependency checks (NOT through ResilientAdapter) to avoid
-    polluting circuit breaker state with probe traffic."""
+    """Readiness probe. Minimal output by design (no pool internals).
+
+    Probes bypass ResilientAdapter so health checks never mutate breaker
+    state or business metrics.
+    """
     from fastapi import HTTPException
 
     try:
-        # Direct base adapter ping - bypasses circuit breaker
-        if hasattr(_BASE, "ping"):
-            _BASE.ping()
-        else:
-            # Fallback: lightweight read that doesn't mutate breaker state
-            _BASE.find_doctors()
-        detail: dict = {"adapter": "ok"}
-        pool = getattr(_BASE, "_pool", None)
-        if pool is not None:
-            stats = pool.get_stats()
-            detail["pool"] = {
-                "available": stats.get("pool_available"),
-                "used": stats.get("pool_used"),
-            }
+        _BASE.ping()
         _SNAPSHOTS.ping()
-        detail["snapshots"] = "ok"
-        return {"status": "ready", **detail}
+        return {"status": "ready"}
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"backend down: {type(e).__name__}") from e
+        raise HTTPException(status_code=503, detail="backend down") from e
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
-def prometheus_metrics() -> str:
+def prometheus_metrics(
+    x_metrics_token: str | None = Header(default=None, alias="X-Metrics-Token"),
+):
+    """Internal counters. Gated by DBI_METRICS_TOKEN when configured
+    (else open, demo-grade). Unknown token -> 404 to hide existence."""
+    from fastapi import HTTPException
+
+    if _SETTINGS.metrics_token and x_metrics_token != _SETTINGS.metrics_token:
+        raise HTTPException(status_code=404, detail="not found")
     return metrics.render_prometheus()
 
 
