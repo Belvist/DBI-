@@ -1,10 +1,13 @@
 PYTHON = PYTHONPATH=. python3
 export PYTHONPATH := .
 
-.PHONY: up down test demo lint eval check
+.PHONY: up up-full down test demo lint eval check
 
 up:
-	docker compose up -d --build || ($(PYTHON) -m uvicorn api.main:app --host 127.0.0.1 --port 8080 &)
+	docker compose up -d --build api-lite || ($(PYTHON) -m uvicorn api.main:app --host 127.0.0.1 --port 8080 &)
+
+up-full:
+	docker compose --profile full up -d --build || true
 
 down:
 	docker compose down || true
@@ -20,6 +23,6 @@ eval:
 	$(PYTHON) -m demo.eval
 
 lint:
-	$(PYTHON) -m ruff check domain clinic_adapter nlu dialogue api voice observability demo tests
+	$(PYTHON) -m ruff check domain clinic_adapter nlu dialogue api voice observability demo tests identity sessions
 
 check: lint test

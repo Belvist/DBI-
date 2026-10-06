@@ -40,3 +40,15 @@ class HallucinatedResponse(ClinicError):
     """Renderer tried to speak a slot/booking the backend never returned."""
 
     code = "hallucinated_response"
+
+
+class UnknownIdentity(ClinicError):
+    """Credential identifies nobody. Fail closed: no patient, no data."""
+
+    code = "unknown_identity"
+
+
+class IdentityMismatch(ClinicError):
+    """Request scoped to patient X, credential belongs to patient Y."""
+
+    code = "identity_mismatch"

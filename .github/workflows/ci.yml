@@ -5,11 +5,26 @@ on:
     branches:
       - main
       - "audit/**"
+      - "feature/**"
   pull_request:
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dbi
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s --health-timeout=3s --health-retries=10
+    env:
+      DBI_PG_URL: postgresql://postgres:postgres@localhost:5432/dbi
     steps:
       - uses: actions/checkout@v4
 
@@ -22,9 +37,11 @@ jobs:
         run: python -m pip install -e ".[dev]"
 
       - name: Lint
-        run: python -m ruff check domain clinic_adapter nlu dialogue api voice observability demo tests
+        run: >-
+          python -m ruff check domain clinic_adapter nlu dialogue api voice
+          observability demo tests identity sessions
 
-      - name: Unit tests
+      - name: Unit tests (incl. Postgres parity)
         run: PYTHONPATH=. python -m pytest tests/ -q
 
       - name: Scenario eval

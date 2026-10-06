@@ -6,9 +6,56 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      DBI_DB_PATH: /tmp/dbi.sqlite
+      DBI_DB_PATH: /data/dbi.sqlite
+      DBI_SESSIONS_PATH: /data/sessions.sqlite
+      DBI_PG_URL: ${DBI_PG_URL:-}
+      DBI_IDENTITY: ${DBI_IDENTITY:-demo}
+      DBI_TOKENS_FILE: ${DBI_TOKENS_FILE:-}
+    volumes:
+      - dbidata:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["full"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 10s
       timeout: 5s
       retries: 10
+
+  api-lite:
+    build: .
+    container_name: dbi-api-lite
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DBI_DB_PATH: /tmp/dbi.sqlite
+      DBI_IDENTITY: demo
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  db:
+    image: postgres:16-alpine
+    container_name: dbi-db
+    environment:
+      POSTGRES_DB: ${DBI_PG_DB:-dbi}
+      POSTGRES_USER: ${DBI_PG_USER:-dbi}
+      POSTGRES_PASSWORD: ${DBI_PG_PASSWORD:?set DBI_PG_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    profiles: ["full"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DBI_PG_USER:-dbi}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  dbidata:
