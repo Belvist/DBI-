@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -29,35 +30,42 @@ def is_transient(exc: BaseException) -> bool:
 
 @dataclass
 class CircuitBreaker:
+    """Thread-safe: one shared instance serves all HTTP/WS workers."""
+
     fail_threshold: int = 5
     window_s: float = 60.0
     open_s: float = 30.0
     _failures: list[float] = field(default_factory=list)
     _opened_at: float | None = field(default=None)
+    _guard: threading.Lock = field(default_factory=threading.Lock)
 
-    def _prune(self, now: float) -> None:
+    def _prune_locked(self, now: float) -> None:
+        # Caller must hold _guard.
         self._failures = [t for t in self._failures if now - t <= self.window_s]
         if self._opened_at is not None and now - self._opened_at >= self.open_s:
             self._opened_at = None  # half-open: next call probes
 
     @property
     def is_open(self) -> bool:
-        self._prune(time.monotonic())
-        return self._opened_at is not None
+        with self._guard:
+            self._prune_locked(time.monotonic())
+            return self._opened_at is not None
 
     def record_success(self) -> None:
-        self._failures.clear()
-        self._opened_at = None
+        with self._guard:
+            self._failures.clear()
+            self._opened_at = None
 
     def record_failure(self) -> bool:
         """Returns True if the breaker just opened."""
-        now = time.monotonic()
-        self._failures.append(now)
-        self._prune(now)
-        if len(self._failures) >= self.fail_threshold and self._opened_at is None:
-            self._opened_at = now
-            return True
-        return False
+        with self._guard:
+            now = time.monotonic()
+            self._failures.append(now)
+            self._prune_locked(now)
+            if len(self._failures) >= self.fail_threshold and self._opened_at is None:
+                self._opened_at = now
+                return True
+            return False
 
     def guard(self) -> None:
         if self.is_open:

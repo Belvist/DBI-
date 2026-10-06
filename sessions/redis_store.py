@@ -52,3 +52,6 @@ class RedisSessionStore:
 
     def drop(self, patient_id: str) -> None:
         self._redis.delete(self._key(patient_id))
+
+    def ping(self) -> None:
+        self._redis.ping()

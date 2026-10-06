@@ -73,3 +73,7 @@ class SessionStore:
         with self._lock:
             self._conn.execute("DELETE FROM snapshots WHERE patient_id=?", (patient_id,))
             self._conn.commit()
+
+    def ping(self) -> None:
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
