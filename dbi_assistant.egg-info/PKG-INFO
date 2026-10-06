@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: dbi-assistant
+Version: 0.1.0
+Summary: DBI voice clinic administrator — deterministic booking core, voice is a thin layer
+Requires-Python: >=3.12
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: pydantic>=2.7
+Requires-Dist: psycopg[binary]>=3.1
+Requires-Dist: psycopg-pool>=3.1
+Requires-Dist: redis>=5
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: httpx>=0.27; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"

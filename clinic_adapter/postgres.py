@@ -352,3 +352,8 @@ class PostgresClinic:
                     "UPDATE slots SET taken_by=%s WHERE slot_id=%s", (by, slot_id)
                 )
             conn.commit()
+
+    def ping(self) -> None:
+        """Lightweight health check - does not mutate state."""
+        with self._pool.connection() as conn:
+            conn.execute("SELECT 1").fetchone()

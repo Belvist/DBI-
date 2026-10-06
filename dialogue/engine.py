@@ -15,7 +15,7 @@ from datetime import datetime
 
 from clinic_adapter.base import ClinicAdapter
 from dialogue import renderer
-from dialogue.state import DialogueState, Flow, Phase
+from dialogue.state import DialogueState, Flow, PendingOperation, Phase
 from domain.adapter_errors import AdapterUnavailable
 from domain.commands import CreateAppointmentCommand, RescheduleCommand
 from domain.errors import SlotUnavailable
@@ -295,6 +295,14 @@ def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ct
         sel = state.candidates[idx]
         state.selected_slot_id = sel.slot.slot_id
         state.phase = Phase.CONFIRM
+        # Create pending operation with stable idempotency_key for this COMMIT
+        if state.pending_operation is None or state.pending_operation.slot_id != state.selected_slot_id:
+            state.pending_operation = PendingOperation(
+                idempotency_key=ctx.idempotency_key,
+                kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
+                slot_id=state.selected_slot_id,
+                booking_id=state.active_booking_id if state.flow == Flow.RESCHEDULE else None,
+            )
         return state, renderer.confirm_slot(sel)
 
     if state.phase == Phase.CONFIRM and state.selected_slot_id:

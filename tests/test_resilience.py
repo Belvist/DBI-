@@ -217,6 +217,8 @@ def test_ready_ok_with_live_backend():
 def test_ready_503_when_backend_down(monkeypatch):
     import api.main as api_main
 
-    monkeypatch.setattr(api_main, "_ADAPTER", ResilientAdapter(DeadAdapter()))
+    # /ready probes the BASE adapter directly (never through the breaker),
+    # so a dead backend is observed even with a closed circuit.
+    monkeypatch.setattr(api_main, "_BASE", DeadAdapter())
     r = client.get("/ready")
     assert r.status_code == 503

@@ -4,12 +4,12 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import datetime
 
 import pytest
 
 from dialogue.state import DialogueState
 from domain.models import PatientRef
-from sessions.cache import SessionCache
 from sessions.locks import patient_turn_lock
 from sessions.redis_store import RedisSessionStore
 from sessions.store import SessionStore
@@ -122,34 +122,67 @@ def test_redis_lock_timeout_when_held():
         lock.release()
 
 
-def test_cache_evicts_idle_and_bounds_size():
-    cache: SessionCache[int] = SessionCache(maxsize=3, idle_ttl_s=0.05)
-    for i in range(5):
-        cache.get_or_create(f"k{i}", lambda i=i: i)
-    assert len(cache) == 3
-    time.sleep(0.06)
-    cache.get_or_create("fresh", lambda: 99)
-    assert len(cache) == 1
+def test_cas_conflict_raises_stale_state(tmp_path):
+    from sessions.errors import StaleState
+
+    store = SessionStore(tmp_path / "s.sqlite")
+    first = _state("p-cas")
+    store.save(first)  # revision 0 -> 1
+    stale = _state("p-cas")  # revision 0, same patient, older base
+    with pytest.raises(StaleState):
+        store.save(stale)
+    # winner's state intact
+    assert store.load("p-cas").revision == 1
 
 
-def test_cache_factory_called_once():
-    cache: SessionCache[object] = SessionCache()
-    calls = []
-    obj = cache.get_or_create("k", lambda: calls.append(1) or object())
-    assert cache.get_or_create("k", lambda: object()) is obj
-    assert len(calls) == 1
+@needs_redis
+def test_two_replicas_alternate_without_rollback(tmp_path):
+    """API-A and API-B share one Redis + one clinic; turns alternate.
+
+    No replica may ever continue from stale local state: B must see the
+    BOOK flow A started, and A must see the CONFIRM B produced.
+    """
+    import uuid
+
+    from clinic_adapter.mock_sqlite import MockSqliteClinic
+    from sessions.coordinator import run_turn
+    from sessions.redis_store import RedisSessionStore
+
+    clinic = MockSqliteClinic(path=tmp_path / "clinic.sqlite")
+    pid = f"p-two-{uuid.uuid4().hex[:6]}"
+    patient = PatientRef(patient_id=pid)
+    now = datetime(2026, 10, 13, 12, 0)
+
+    def turn_on_replica(text: str):
+        store = RedisSessionStore(REDIS_URL)  # fresh objects per replica
+        return run_turn(
+            patient=patient, text=text, idempotency_key=None,
+            adapter=clinic, snapshots=store, redis_url=REDIS_URL, now=now,
+        )
+
+    _, sess1 = turn_on_replica("Запиши меня к неврологу")
+    assert sess1.state.phase.value == "elicit" and sess1.state.flow.value == "book"
+
+    s2, sess2 = turn_on_replica("На следующей неделе вечером")
+    assert sess2.state.phase.value == "propose" and len(sess2.state.candidates) == 3, s2[:120]
+
+    s3, sess3 = turn_on_replica("Первый вариант")
+    assert sess3.state.phase.value == "confirm", s3[:120]
+
+    s4, sess4 = turn_on_replica("Да")
+    assert "записаны" in s4.lower() and sess4.state.active_booking_id
+    assert len(clinic.get_appointments(patient)) == 1
 
 
-def test_cache_thread_safety_smoke():
-    cache: SessionCache[int] = SessionCache(maxsize=50, idle_ttl_s=60)
+@needs_redis
+def test_redis_cas_conflict_raises_stale_state():
+    from sessions.errors import StaleState
 
-    def hammer(n: int):
-        for i in range(200):
-            cache.get_or_create(f"k{(n + i) % 60}", lambda i=i: i)
-
-    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert len(cache) <= 50
+    store = RedisSessionStore(REDIS_URL)
+    store.drop("p-cas-r")
+    first = _state("p-cas-r")
+    store.save(first)
+    with pytest.raises(StaleState):
+        store.save(_state("p-cas-r"))
+    assert store.load("p-cas-r").revision == 1
+    store.drop("p-cas-r")

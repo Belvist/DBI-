@@ -377,6 +377,11 @@ class MockSqliteClinic:
             self._conn.commit()
             return len(rows)
 
+    def ping(self) -> None:
+        """Lightweight health check - does not mutate state."""
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
+
     # test-only helper: simulate a race by taking a slot out-of-band
     def steal_slot(self, slot_id: str, by: str = "other_patient") -> None:
         with self._lock:

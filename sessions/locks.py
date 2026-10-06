@@ -25,17 +25,26 @@ def _local_lock(patient_id: str) -> threading.Lock:
         return _local_locks.setdefault(patient_id, threading.Lock())
 
 
+class Lease:
+    """Handle to a held patient lock. `lost` is set by the heartbeat when
+    the lease demonstrably moved to another holder (extend returned 0)."""
+
+    def __init__(self) -> None:
+        self.lost = False
+
+
 @contextmanager
 def patient_turn_lock(
     redis_url: str, patient_id: str, timeout_s: float = 10, lease_s: int = LOCK_TTL_S
-) -> Iterator[None]:
+) -> Iterator[Lease]:
     """Serialize one dialogue turn for a patient. Raises on lock timeout."""
+    lease = Lease()
     if not redis_url:
         locked = _local_lock(patient_id).acquire(timeout=timeout_s)
         if not locked:
             raise TimeoutError(f"patient lock timeout: {patient_id}")
         try:
-            yield
+            yield lease
         finally:
             _local_lock(patient_id).release()
         return
@@ -64,14 +73,15 @@ def patient_turn_lock(
         while not stop.wait(max(0.2, lease_s / 3)):
             try:
                 if extend(keys=[LOCK_PREFIX + patient_id], args=[token, lease_s * 1000]) == 0:
-                    break  # lock lost to someone else; holder still finishes its turn
+                    lease.lost = True
+                    break
             except Exception:
                 break  # redis down; holder still finishes its turn
 
     beat = threading.Thread(target=_heartbeat, daemon=True)
     beat.start()
     try:
-        yield
+        yield lease
     finally:
         stop.set()
         beat.join(timeout=lease_s)

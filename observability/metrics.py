@@ -24,7 +24,8 @@ def reset() -> None:
 
 def render_prometheus() -> str:
     lines = []
-    for name in sorted(snapshot()):
+    snap = snapshot()
+    for name in sorted(snap):
         lines.append(f"# TYPE dbi_{name} counter")
-        lines.append(f"dbi_{name} {_counters[name]}")
+        lines.append(f"dbi_{name} {snap[name]}")
     return "\n".join(lines) + ("\n" if lines else "")

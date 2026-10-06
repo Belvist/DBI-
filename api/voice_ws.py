@@ -42,7 +42,8 @@ from api.booking_service import DialogueSession
 from domain.errors import UnknownIdentity
 from domain.models import PatientRef
 from identity.providers import IdentityContext
-from sessions.locks import patient_turn_lock
+from sessions.coordinator import run_turn
+from sessions.errors import StaleState
 from voice.runtime import VoiceRuntime
 
 router = APIRouter()
@@ -82,7 +83,7 @@ async def voice_ws(ws: WebSocket) -> None:
                 await ws.send_json({"type": "stopped", "gen_id": gen})
             elif kind == "user_text":
                 reply = await anyio.to_thread.run_sync(
-                    _do_turn, ws.app.state, patient, runtime, session, str(msg.get("text", ""))
+                    _do_turn, ws.app.state, patient, runtime, str(msg.get("text", ""))
                 )
                 await ws.send_json(reply)
             else:
@@ -91,22 +92,43 @@ async def voice_ws(ws: WebSocket) -> None:
         return
 
 
-def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime,
-             session: DialogueSession, text: str) -> dict:
-    """One blocking dialogue turn: lock -> turn -> save. Runs in a worker thread."""
+def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime, text: str) -> dict:
+    """One blocking dialogue turn on authoritative state. Runs in a worker thread.
+
+    The session is rebuilt from the snapshot store on EVERY turn: a
+    long-lived WS connection never trusts a stale local DialogueSession.
+    """
+    from voice.runtime import Generation
+
     t0 = time.monotonic()
-    with patient_turn_lock(app_state.redis_url, patient.patient_id):
-        speech, gen = runtime.on_user_text(text)
-        t_ms = int((time.monotonic() - t0) * 1000)
-        app_state.snapshots.save(session.state)
+    gen = Generation()
+    runtime.current = gen
+    runtime.user_is_speaking = False
+    try:
+        speech, sess = run_turn(
+            patient=patient,
+            text=text,
+            idempotency_key=None,
+            adapter=runtime.session.adapter,
+            snapshots=app_state.snapshots,
+            redis_url=app_state.redis_url,
+            now=runtime.session.now,
+        )
+    except StaleState:
+        return {"type": "error", "detail": "concurrent turn, please repeat"}
+    runtime.session = sess  # rebind: barge-in trace follows the latest session
+    runtime.trace = sess.trace
+    t_ms = int((time.monotonic() - t0) * 1000)
     if gen.cancelled or not speech:
+        runtime.trace.log("gen_superseded", gen_id=gen.gen_id)
         return {"type": "superseded", "gen_id": gen.gen_id}
+    runtime.trace.log("assistant_speech", gen_id=gen.gen_id, text=speech[:160])
     return {
         "type": "speech",
         "gen_id": gen.gen_id,
         "text": speech,
-        "phase": session.state.phase.value,
-        "flow": session.state.flow.value,
-        "booking_id": session.state.active_booking_id,
+        "phase": sess.state.phase.value,
+        "flow": sess.state.flow.value,
+        "booking_id": sess.state.active_booking_id,
         "t_ms": t_ms,
     }
