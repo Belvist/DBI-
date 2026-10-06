@@ -36,7 +36,10 @@ class DialogueSession:
         self._allowed_bids: list[str] = []
 
     def turn(self, text: str, idempotency_key: str | None = None) -> str:
+        import re
+
         metrics.inc("turns_total")
+        user_times = set(re.findall(r"(?<!\d)(\d{1,2}:\d{2})(?!\d)", text))
         det_out = det.parse(text, now=self.now)
         fused = fuse(det_out, self.proposer.propose(text, self.now))
         ctx = TurnCtx(now=self.now, trace=self.trace)
@@ -45,7 +48,7 @@ class DialogueSession:
             ctx.idempotency_key_explicit = True
         self.state, speech = step(self.state, fused, self.adapter, ctx)
         self._refresh_allowlist()
-        ok, safe = validate(speech, self._allowed_dts, self._allowed_bids)
+        ok, safe = validate(speech, self._allowed_dts, self._allowed_bids, user_times)
         if not ok:
             self.trace.log("hallucination_blocked", draft=speech[:120])
             metrics.inc("fallbacks_total")

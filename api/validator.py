@@ -29,14 +29,21 @@ def validate(
     text: str,
     allowed_datetimes: list[datetime],
     allowed_booking_ids: list[str],
+    user_mentioned_times: set[str] | None = None,
 ) -> tuple[bool, str]:
-    """Return (ok, text_or_fallback)."""
+    """Return (ok, text_or_fallback).
+
+    Times the USER just said ("а в 20:00 есть?") may be echoed back in a
+    negation ("в 20:00 нет") — that is not a hallucination. Only positive
+    claims (full datetime offers, booking ids) must come from the adapter.
+    """
     allowed_pairs = {
         (d.day, d.month, d.strftime("%H:%M"))
         for d in allowed_datetimes
     }
     allowed_times = {d.strftime("%H:%M") for d in allowed_datetimes}
     allowed_ids = set(allowed_booking_ids)
+    user_times = user_mentioned_times or set()
 
     full_matches = list(_FULL_DT_RE.finditer(text))
     for m in full_matches:
@@ -47,12 +54,12 @@ def validate(
             return False, _SAFE_FALLBACK
 
     # Also validate standalone times. Times already covered by a full datetime
-    # are fine; all others still must exist in the adapter allow-list.
+    # are fine; user-mentioned times echoed in a negation are fine too.
     covered_spans = [m.span(3) for m in full_matches]
     for m in _TIME_RE.finditer(text):
         if any(m.start() >= a and m.end() <= b for a, b in covered_spans):
             continue
-        if m.group(1) not in allowed_times:
+        if m.group(1) not in allowed_times and m.group(1) not in user_times:
             return False, _SAFE_FALLBACK
 
     for m in _BOOKING_RE.finditer(text):

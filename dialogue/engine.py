@@ -149,6 +149,18 @@ def _on_book(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: 
         state.last_error = "no_slots"
         return state, renderer.no_slots()
 
+    if nlu.exact_time:
+        # "мне надо в 20:00": narrow to that time, but never invent.
+        matched = _filter_by_exact_time(slots, nlu.exact_time)
+        ctx.trace.log("exact_time_filter", want=nlu.exact_time, matched=len(matched))
+        if matched:
+            state.candidates = matched
+            state.phase = Phase.PROPOSE
+            return state, renderer.propose_slots(matched)
+        state.candidates = slots
+        state.phase = Phase.PROPOSE
+        return state, renderer.no_exact_time(nlu.exact_time, slots)
+
     state.candidates = slots
     state.phase = Phase.PROPOSE
     return state, renderer.propose_slots(slots)
@@ -286,21 +298,42 @@ def _pick_candidate(state: DialogueState, nlu: NLUResult) -> int:
     if nlu.slot_index is not None and 0 <= nlu.slot_index < len(state.candidates):
         return nlu.slot_index
 
-    if nlu.raw_time_text:
+    hh_mm = None
+    if nlu.exact_time:
+        try:
+            hh, mm = nlu.exact_time.split(":")
+            hh_mm = (int(hh), int(mm))
+        except ValueError:
+            hh_mm = None
+    if hh_mm is None and nlu.raw_time_text:
         import re
 
         t = nlu.raw_time_text.lower()
         m = re.search(r"(\d{1,2})[:.](\d{2})", t)
-        hh_mm = None
         if m:
             hh_mm = (int(m.group(1)), int(m.group(2)))
         elif "половина седьмого" in t or ("половин" in t and "седьм" in t):
             hh_mm = (18, 30)
-        if hh_mm:
-            for i, c in enumerate(state.candidates):
-                if c.slot.start.hour == hh_mm[0] and c.slot.start.minute == hh_mm[1]:
-                    return i
+    if hh_mm:
+        for i, c in enumerate(state.candidates):
+            if c.slot.start.hour == hh_mm[0] and c.slot.start.minute == hh_mm[1]:
+                return i
     return 0
+
+
+def _filter_by_exact_time(
+    candidates: list, exact_time: str
+) -> list:
+    """Keep only slots at the requested HH:MM ('в 20:00' means 20:00 sharp)."""
+    try:
+        hh, mm = exact_time.split(":")
+        hh_mm = (int(hh), int(mm))
+    except ValueError:
+        return candidates
+    return [
+        c for c in candidates
+        if c.slot.start.hour == hh_mm[0] and c.slot.start.minute == hh_mm[1]
+    ]
 
 
 def _uncertain_pending(state: DialogueState):
@@ -314,6 +347,10 @@ def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ct
     # NOTE: uncertain-pending turns never reach here: step()'s guard routes
     # CONFIRM to _reconcile_pending and everything else to pending_unresolved.
     if state.phase == Phase.PROPOSE and state.candidates:
+        if nlu.exact_time and not _filter_by_exact_time(state.candidates, nlu.exact_time):
+            # "давай в 20:00" matches nothing offered: don't confirm slot 0
+            # by default — say so and keep the real alternatives.
+            return state, renderer.no_exact_time(nlu.exact_time, state.candidates)
         idx = _pick_candidate(state, nlu)
         sel = state.candidates[idx]
         state.selected_slot_id = sel.slot.slot_id
@@ -339,7 +376,11 @@ def _complete_booking(state: DialogueState, adapter, appt, ctx, *, moved: bool):
     doctors = {d.doctor_id: d for d in adapter.find_doctors()}
     d = doctors[appt.doctor_id]
     ctx.trace.log("booking_moved" if moved else "booking_created", booking_id=appt.booking_id)
+    # Full search-context reset: a finished flow must not leak its
+    # specialty/date into the NEXT request ("хочу записаться" starts clean).
     state.phase, state.flow = Phase.IDLE, Flow.NONE
+    state.specialty, state.doctor_text = None, None
+    state.date_from, state.date_to, state.time_preference = None, None, None
     state.candidates, state.selected_slot_id = [], None
     state.active_booking_id = appt.booking_id
     state.pending_operation = None

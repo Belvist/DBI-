@@ -5,6 +5,7 @@ from datetime import datetime
 
 from api.booking_service import DialogueSession
 from clinic_adapter.mock_sqlite import MockSqliteClinic
+from dialogue.state import Phase
 from domain.models import PatientRef
 
 NOW = datetime(2026, 10, 13, 12, 0)
@@ -96,3 +97,30 @@ def test_no_hallucinated_slot_without_backend():
     times = set(re.findall(r"\d{1,2}:\d{2}", r))
     real = {c.slot.start.strftime("%H:%M") for c in s.state.candidates}
     assert times <= real
+
+
+def test_finished_booking_resets_search_context():
+    s = _sess("p-reset-1")
+    s.turn("Запиши меня к неврологу на следующей неделе вечером")
+    s.turn("Первый вариант")
+    s.turn("Да")
+    assert s.state.active_booking_id
+    # next bare request must start clean, not reuse stale neuro+dates
+    r = s.turn("хочу записаться")
+    assert "специалист" in r.lower()
+    assert s.state.phase == Phase.ELICIT
+
+
+def test_exact_time_narrows_or_reports_honestly():
+    s = _sess("p-time-1")
+    s.turn("Запиши меня к неврологу на следующей неделе")
+    assert s.state.candidates
+    have_20 = any(c.slot.start.strftime("%H:%M") == "20:00" for c in s.state.candidates)
+    r = s.turn("мне надо в 20:00")
+    if have_20:
+        assert "20:00" in r
+        assert all(
+            c.slot.start.strftime("%H:%M") == "20:00" for c in s.state.candidates
+        )
+    else:
+        assert "20:00" in r and "нет" in r.lower()
