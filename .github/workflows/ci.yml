@@ -22,7 +22,7 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd="pg_isready -U postgres"
-          --interval=5s --timeout=3s --retries=10
+          --health-interval=5s --health-timeout=3s --health-retries=10
     env:
       DBI_PG_URL: postgresql://postgres:postgres@localhost:5432/dbi
     steps:
