@@ -314,6 +314,11 @@ def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ct
 def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
     assert state.selected_slot_id
     state.phase = Phase.COMMIT
+    # Retry of an unknown WRITE reuses the SAME idempotency_key so the
+    # backend dedups instead of double-booking. A fresh TurnCtx key is only
+    # used when no operation is pending.
+    pending = state.pending_operation
+    key = pending.idempotency_key if pending is not None else ctx.idempotency_key
     try:
         if state.flow == Flow.RESCHEDULE and state.active_booking_id:
             appt = adapter.reschedule_appointment(
@@ -321,7 +326,7 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
                     patient=state.patient,
                     booking_id=state.active_booking_id,
                     new_slot_id=state.selected_slot_id,
-                    idempotency_key=ctx.idempotency_key,
+                    idempotency_key=key,
                 )
             )
             doctors = {d.doctor_id: d for d in adapter.find_doctors()}
@@ -330,13 +335,14 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
             state.phase, state.flow = Phase.IDLE, Flow.NONE
             state.candidates, state.selected_slot_id = [], None
             state.active_booking_id = appt.booking_id
+            state.pending_operation = None
             return state, renderer.moved(appt, d)
 
         appt = adapter.create_appointment(
             CreateAppointmentCommand(
                 patient=state.patient,
                 slot_id=state.selected_slot_id,
-                idempotency_key=ctx.idempotency_key,
+                idempotency_key=key,
             )
         )
         doctors = {d.doctor_id: d for d in adapter.find_doctors()}
@@ -349,18 +355,27 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
         state.phase, state.flow = Phase.IDLE, Flow.NONE
         state.candidates, state.selected_slot_id = [], None
         state.active_booking_id = appt.booking_id
+        state.pending_operation = None
         return state, renderer.booked(appt, d)
 
     except AdapterUnavailable:
         # WRITE outcome unknown: the booking may have committed server-side
-        # while the response was lost. Keep the selected slot so a retry
-        # hits the SAME slot: if it committed, the adapter answers
-        # SlotUnavailable (taken) and we recover via re-search instead of
-        # ever double-booking.
+        # while the response was lost. Persist the operation identity so the
+        # next retry reuses the SAME idempotency_key and the backend dedups.
+        # Keep the selected slot as well: if the retry hits a taken slot,
+        # SlotUnavailable recovers via re-search instead of double-booking.
         from observability import metrics
+
+        from dialogue.state import PendingOperation
 
         ctx.trace.log("commit_outcome_unknown", slot=state.selected_slot_id)
         metrics.inc("fallbacks_total")
+        state.pending_operation = PendingOperation(
+            idempotency_key=key,
+            kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
+            booking_id=state.active_booking_id,
+            slot_id=state.selected_slot_id,
+        )
         state.phase = Phase.CONFIRM
         return state, renderer.outcome_unknown()
 

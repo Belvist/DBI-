@@ -159,12 +159,56 @@ def test_commit_unknown_never_claims_nothing_recorded():
     # the lie we avoid: the booking IS in the DB
     assert len(sqlite.get_appointments(sess.patient)) == 1
     assert sess.state.active_booking_id is None
-    # backend recovers: retry hits the same taken slot -> race recovery,
-    # never a duplicate booking
+    # backend recovers: retry reuses the pending key -> the ORIGINAL booking
+    # comes back, no duplicate, no 'pick another time'
+    first_id = sqlite.get_appointments(sess.patient)[0].booking_id
     flaky.drop = False
     retry = sess.turn("Да")
-    assert "недоступно" in retry.lower() or "другой вариант" in retry.lower()
+    assert "записаны" in retry.lower() and first_id in retry
     assert len(sqlite.get_appointments(sess.patient)) == 1
+    assert sess.state.pending_operation is None
+
+
+def test_unknown_write_retries_with_same_key_across_replicas(tmp_path):
+    """Commit lands, response lost, next turn runs on ANOTHER replica.
+
+    The retry must reuse the pending idempotency_key persisted in the
+    snapshot — the backend returns the ORIGINAL booking, no duplicate,
+    no 'pick another time'.
+    """
+    from sessions.store import SessionStore
+
+    sqlite = MockSqliteClinic()
+    flaky = CommitThenDrop(sqlite)
+    store = SessionStore(tmp_path / "s.sqlite")
+    patient = PatientRef(patient_id="p-reconcile")
+    sess = DialogueSession(patient, ResilientAdapter(flaky), now=NOW)
+    _drive_to_confirm(sess)
+    assert "не удалось подтвердить" in sess.turn("Да").lower()
+    pending = sess.state.pending_operation
+    assert pending is not None
+    store.save(sess.state)
+
+    # replica B: brand-new objects, state only from the snapshot
+    sess2 = DialogueSession(patient, ResilientAdapter(flaky), now=NOW)
+    sess2.state = store.load(patient.patient_id)
+    assert sess2.state.pending_operation.idempotency_key == pending.idempotency_key
+
+    flaky.drop = False  # backend recovers
+    speech = sess2.turn("Да")
+    assert "записаны" in speech.lower()
+    original = sqlite.get_appointments(patient)
+    assert len(original) == 1
+    assert original[0].booking_id in speech
+    assert sess2.state.pending_operation is None
+    assert sess2.state.active_booking_id == original[0].booking_id
+
+
+def _drive_to_confirm(sess):
+    sess.turn("Запиши меня к неврологу на следующей неделе вечером")
+    assert sess.state.candidates
+    sess.turn("Первый вариант")
+    assert sess.state.phase.value == "confirm"
 
 
 def test_ready_503_when_snapshots_die_after_startup(monkeypatch):
