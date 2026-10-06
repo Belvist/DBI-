@@ -1,3 +1,156 @@
-<!doctype html><meta charset="utf-8"><title>DBI voice (thin client)</title>
-<h3>DBI voice client — микрофон вторым слоем (пока текст)</h3>
-<p>Полноценный микрофон/STT/TTS подключается после текстового DoD. Сейчас: тот же /dialogue/turn.</p>
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DBI Assistant — голосовое демо</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
+  #log { border: 1px solid #ccc; border-radius: 8px; min-height: 220px; max-height: 380px;
+         overflow-y: auto; padding: 12px; margin: 12px 0; background: #fafafa; }
+  .u { color: #0b5ed7; margin: 6px 0; } .a { color: #137333; margin: 6px 0; }
+  .sys { color: #888; font-size: 0.85em; }
+  #dash { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
+  #dash div { border: 1px solid #ddd; border-radius: 8px; padding: 8px; font-size: 0.9em; }
+  #dash b { display: block; font-size: 0.75em; color: #666; text-transform: uppercase; }
+  button { font-size: 1em; padding: 8px 16px; margin-right: 8px; cursor: pointer; }
+  #micBtn.live { background: #d93025; color: #fff; }
+  input[type=text] { width: 70%; padding: 8px; }
+</style>
+<h2>DBI Assistant — голосовой администратор клиники</h2>
+<div id="dash">
+  <div><b>Состояние</b><span id="dState">—</span></div>
+  <div><b>Запись</b><span id="dBooking">—</span></div>
+  <div><b>Задержка хода</b><span id="dLat">—</span></div>
+</div>
+<div>
+  <input type="text" id="tokenIn" value="demo" size="16" title="Bearer-токен пациента">
+  <button id="connBtn">Подключить</button>
+  <button id="micBtn" disabled>🎤 Говорить</button>
+  <button id="stopBtn">⏹ Стоп</button>
+</div>
+<div id="log"></div>
+<div>
+  <input type="text" id="textIn" placeholder="Текстовый фолбэк: Хочу записаться к неврологу…">
+  <button id="sendBtn">➤</button>
+</div>
+<p class="sys">STT/TTS — браузерные (Web Speech API, ru-RU). Перебивание: заговорите поверх ответа —
+синтез остановится мгновенно, сервер получит barge_in. Требует Chrome и микрофон (localhost/HTTPS).</p>
+<script>
+const log = document.getElementById("log");
+const micBtn = document.getElementById("micBtn");
+let speaking = false, micOn = false, lastGen = null;
+let ws = null;
+// Auth через subprotocol (не query string — токен не должен попадать в логи):
+// ["dbi-voice", "<bearer-token>"]. Пациент определяется только сервером.
+function connect() {
+  const token = document.getElementById("tokenIn").value.trim();
+  if (ws) { try { ws.close(); } catch (_) {} }
+  ws = new WebSocket(
+    (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/voice/ws",
+    ["dbi-voice", token]
+  );
+  ws.onopen = () => { sys("Соединение открыто. Нажмите «Говорить»."); micBtn.disabled = false; };
+  ws.onclose = (e) => {
+    sys(e.code === 4401 ? "Отказ: неверный токен (4401)." : "Соединение закрыто. Обновите страницу.");
+    micBtn.disabled = true;
+  };
+  ws.onmessage = onServerMessage;
+}
+document.getElementById("connBtn").onclick = connect;
+
+function line(cls, who, text) {
+  const d = document.createElement("div");
+  d.className = cls; d.textContent = who + text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+function sys(t) { line("sys", "", t); }
+
+function onServerMessage(ev) {
+  const m = JSON.parse(ev.data);
+  if (m.type === "speech") {
+    lastGen = m.gen_id;
+    document.getElementById("dState").textContent = m.flow + " / " + m.phase;
+    document.getElementById("dBooking").textContent = m.booking_id || "—";
+    document.getElementById("dLat").textContent = m.t_ms + " мс";
+    line("a", "Ассистент: ", m.text);
+    speak(m.text, m.gen_id);
+  } else if (m.type === "superseded") {
+    sys("Ход отменён перебиванием (" + m.gen_id + ").");
+  } else if (m.type === "stopped") {
+    sys("Остановлено (" + m.gen_id + "). Слушаю…");
+  }
+}
+
+function pickRuVoice() {
+  const vs = speechSynthesis.getVoices();
+  return vs.find(v => v.lang.startsWith("ru")) || null;
+}
+if ("speechSynthesis" in window) speechSynthesis.getVoices();
+
+function speak(text, genId) {
+  if (!("speechSynthesis" in window)) { sys("TTS недоступен в этом браузере."); return; }
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "ru-RU";
+  const v = pickRuVoice(); if (v) u.voice = v;
+  u.onstart = () => { speaking = true; };
+  u.onend = u.onerror = () => { speaking = false; };
+  u._gen = genId;
+  speechSynthesis.speak(u);
+}
+function stopSpeaking() {
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  speaking = false;
+}
+function send(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { sys("Нет соединения — нажмите «Подключить»."); return; }
+  ws.send(JSON.stringify(obj));
+}
+
+// ---- mic: Web Speech API, ru-RU, interim -> instant barge-in ----
+const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null;
+if (!Rec) {
+  sys("Распознавание речи недоступно — используйте Chrome и текстовый фолбэк.");
+  micBtn.disabled = true;
+} else {
+  rec = new Rec();
+  rec.lang = "ru-RU"; rec.interimResults = true; rec.continuous = false;
+  rec.onresult = (e) => {
+    let interim = "", fin = "";
+    for (const r of e.results) { if (r.isFinal) fin += r[0].transcript; else interim += r[0].transcript; }
+    const heard = (fin || interim).trim();
+    if (!heard) return;
+    if (speaking && interim) {
+      // instant local barge-in + server-side cancel
+      stopSpeaking();
+      send({ type: "barge_in" });
+    }
+    if (fin) {
+      line("u", "Пациент: ", heard);
+      send({ type: "user_text", text: heard });
+    }
+  };
+  rec.onend = () => { micOn = false; micBtn.classList.remove("live"); micBtn.textContent = "🎤 Говорить"; };
+  rec.onerror = (e) => sys("Mic: " + e.error);
+}
+micBtn.onclick = () => {
+  if (!rec) return;
+  if (micOn) { rec.stop(); return; }
+  try { rec.start(); micOn = true; micBtn.classList.add("live"); micBtn.textContent = "● Слушаю…"; }
+  catch (e) { sys("Mic: " + e.message); }
+};
+document.getElementById("stopBtn").onclick = () => {
+  stopSpeaking();
+  if (rec && micOn) rec.stop();
+  send({ type: "barge_in" });
+};
+document.getElementById("sendBtn").onclick = () => {
+  const t = document.getElementById("textIn").value.trim();
+  if (!t) return;
+  line("u", "Пациент: ", t);
+  send({ type: "user_text", text: t });
+  document.getElementById("textIn").value = "";
+};
+</script>
+</html>

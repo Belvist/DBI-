@@ -10,15 +10,19 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from api.booking_service import DialogueSession
+from api.voice_ws import router as voice_router
 from clinic_adapter.mock_sqlite import MockSqliteClinic
 from domain.models import PatientRef
 from identity.deps import identify_patient, require_scope
 from identity.providers import resolve_provider
 from sessions.store import SessionStore
+from voice.stt import BrowserSTT
+from voice.tts import BrowserTTS
 
 log = logging.getLogger("dbi.api")
 
-app = FastAPI(title="DBI Clinic Assistant", version="0.1.0")
+app = FastAPI(title="DBI Clinic Assistant", version="0.2.0")
+app.include_router(voice_router)
 
 _DB_PATH = os.getenv("DBI_DB_PATH", ":memory:")
 _PG_URL = os.getenv("DBI_PG_URL", "")
@@ -34,6 +38,8 @@ _IDENTITY = resolve_provider()
 _SNAPSHOTS = SessionStore(path=os.getenv("DBI_SESSIONS_PATH", ":memory:"))
 _SESSIONS: dict[str, DialogueSession] = {}
 _DEMO_NOW = datetime(2026, 10, 13, 12, 0)
+_STT = BrowserSTT()
+_TTS = BrowserTTS()
 
 
 def _session(patient: PatientRef) -> DialogueSession:
@@ -44,6 +50,11 @@ def _session(patient: PatientRef) -> DialogueSession:
             sess.state = restored
         _SESSIONS[patient.patient_id] = sess
     return _SESSIONS[patient.patient_id]
+
+
+app.state.session_factory = _session
+app.state.identity = _IDENTITY
+app.state.snapshots = _SNAPSHOTS
 
 
 class TurnIn(BaseModel):
@@ -58,6 +69,8 @@ def health() -> dict:
         "status": "ok",
         "service": "dbi-assistant",
         "identity": type(_IDENTITY).__name__,
+        "stt": _STT.describe(),
+        "tts": _TTS.describe(),
     }
 
 
@@ -98,6 +111,14 @@ def dialogue_turn(
         "flow": s.state.flow.value,
         "trace": [{"seq": e.seq, "kind": e.kind, "data": e.data} for e in s.trace.events[-8:]],
     }
+
+
+@app.get("/voice", response_class=HTMLResponse)
+def voice_client():
+    from pathlib import Path
+
+    page = Path(__file__).resolve().parent.parent / "voice" / "web" / "index.html"
+    return HTMLResponse(page.read_text(encoding="utf-8"))
 
 
 @app.get("/", response_class=HTMLResponse)
