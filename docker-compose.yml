@@ -6,19 +6,25 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
+      DBI_ENV: ${DBI_ENV:-demo}
       DBI_DB_PATH: /data/dbi.sqlite
       DBI_SESSIONS_PATH: /data/sessions.sqlite
-      DBI_PG_URL: ${DBI_PG_URL:-}
+      DBI_PG_URL: ${DBI_PG_URL:-postgresql://dbi:dbi_dev@db:5432/dbi}
+      DBI_PG_POOL_MAX: ${DBI_PG_POOL_MAX:-10}
+      DBI_REDIS_URL: ${DBI_REDIS_URL:-redis://cache:6379/0}
       DBI_IDENTITY: ${DBI_IDENTITY:-demo}
       DBI_TOKENS_FILE: ${DBI_TOKENS_FILE:-}
+      DBI_ALLOW_SEED: ${DBI_ALLOW_SEED:-1}
     volumes:
       - dbidata:/data
     depends_on:
       db:
         condition: service_healthy
+      cache:
+        condition: service_healthy
     profiles: ["full"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready')"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -31,11 +37,28 @@ services:
     environment:
       DBI_DB_PATH: /tmp/dbi.sqlite
       DBI_IDENTITY: demo
+    profiles: ["lite"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ready')"]
       interval: 10s
       timeout: 5s
       retries: 10
+
+  cache:
+    image: redis:7-alpine
+    container_name: dbi-cache
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    profiles: ["full"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
 
   db:
     image: postgres:16-alpine
@@ -43,7 +66,7 @@ services:
     environment:
       POSTGRES_DB: ${DBI_PG_DB:-dbi}
       POSTGRES_USER: ${DBI_PG_USER:-dbi}
-      POSTGRES_PASSWORD: ${DBI_PG_PASSWORD:?set DBI_PG_PASSWORD}
+      POSTGRES_PASSWORD: ${DBI_PG_PASSWORD:-dbi_dev}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
@@ -59,3 +82,4 @@ services:
 volumes:
   pgdata:
   dbidata:
+  redisdata:

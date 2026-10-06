@@ -15,7 +15,8 @@ from datetime import datetime
 
 from clinic_adapter.base import ClinicAdapter
 from dialogue import renderer
-from dialogue.state import DialogueState, Flow, Phase
+from dialogue.state import DialogueState, Flow, PendingOperation, Phase
+from domain.adapter_errors import AdapterUnavailable
 from domain.commands import CreateAppointmentCommand, RescheduleCommand
 from domain.errors import SlotUnavailable
 from domain.models import Specialty
@@ -28,6 +29,10 @@ class TurnCtx:
     now: datetime
     trace: Trace
     idempotency_key: str = field(default_factory=lambda: "ik-" + uuid.uuid4().hex[:12])
+    # True when the caller supplied idempotency_key explicitly (API contract).
+    # An explicit key always wins over a pending one; otherwise the pending
+    # operation's key is reused so unknown-WRITE retries dedup server-side.
+    idempotency_key_explicit: bool = False
 
 
 def _spec(s: str | None) -> Specialty | None:
@@ -82,7 +87,27 @@ def step(
         Intent.CORRECT: _on_correct,
         Intent.UNKNOWN: _on_unknown,
     }[nlu.intent]
-    return handler(state, nlu, adapter, ctx)
+    try:
+        # An uncertain WRITE outranks the normal state machine: no new
+        # request may mutate flow/candidates/selection until reconciled,
+        # or the dialogue can wedge (PROPOSE-new then blocked forever).
+        # STATUS stays available (read-only); CONFIRM reconciles.
+        if _uncertain_pending(state) is not None:
+            if nlu.intent == Intent.CONFIRM:
+                return _reconcile_pending(state, adapter, ctx)
+            if nlu.intent != Intent.GET_STATUS:
+                ctx.trace.log("uncertain_guard")
+                return state, renderer.pending_unresolved()
+        return handler(state, nlu, adapter, ctx)
+    except AdapterUnavailable:
+        # Fail-safe: backend pain never becomes an invented slot or booking.
+        # No state committed by the failed call; the turn stays retryable.
+        from observability import metrics
+
+        ctx.trace.log("adapter_unavailable")
+        metrics.inc("fallbacks_total")
+        state.phase = Phase.ELICIT
+        return state, renderer.temporarily_unavailable()
 
 
 def _on_book(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: TurnCtx):
@@ -278,12 +303,29 @@ def _pick_candidate(state: DialogueState, nlu: NLUResult) -> int:
     return 0
 
 
+def _uncertain_pending(state: DialogueState):
+    pending = state.pending_operation
+    if pending is not None and pending.status == "uncertain":
+        return pending
+    return None
+
+
 def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: TurnCtx):
+    # NOTE: uncertain-pending turns never reach here: step()'s guard routes
+    # CONFIRM to _reconcile_pending and everything else to pending_unresolved.
     if state.phase == Phase.PROPOSE and state.candidates:
         idx = _pick_candidate(state, nlu)
         sel = state.candidates[idx]
         state.selected_slot_id = sel.slot.slot_id
         state.phase = Phase.CONFIRM
+        # Create pending operation with stable idempotency_key for this COMMIT
+        if state.pending_operation is None or state.pending_operation.slot_id != state.selected_slot_id:
+            state.pending_operation = PendingOperation(
+                idempotency_key=ctx.idempotency_key,
+                kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
+                slot_id=state.selected_slot_id,
+                booking_id=state.active_booking_id if state.flow == Flow.RESCHEDULE else None,
+            )
         return state, renderer.confirm_slot(sel)
 
     if state.phase == Phase.CONFIRM and state.selected_slot_id:
@@ -292,9 +334,93 @@ def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ct
     return _on_unknown(state, nlu, adapter, ctx)
 
 
+def _complete_booking(state: DialogueState, adapter, appt, ctx, *, moved: bool):
+    """Shared success path: ground the speech, reset the machine, clear pending."""
+    doctors = {d.doctor_id: d for d in adapter.find_doctors()}
+    d = doctors[appt.doctor_id]
+    ctx.trace.log("booking_moved" if moved else "booking_created", booking_id=appt.booking_id)
+    state.phase, state.flow = Phase.IDLE, Flow.NONE
+    state.candidates, state.selected_slot_id = [], None
+    state.active_booking_id = appt.booking_id
+    state.pending_operation = None
+    return state, renderer.moved(appt, d) if moved else renderer.booked(appt, d)
+
+
+def _reconcile_pending(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
+    """Retry an uncertain WRITE using ONLY the persisted pending operation.
+
+    Never touches flow/candidates/selection: those may have been left behind
+    by newer user turns, and the operation identity lives in `pending`.
+    """
+    from observability import metrics
+
+    p = state.pending_operation
+    assert p is not None and p.status == "uncertain"
+    state.phase = Phase.COMMIT
+    try:
+        if p.kind == "reschedule":
+            assert p.booking_id is not None
+            appt = adapter.reschedule_appointment(
+                RescheduleCommand(
+                    patient=state.patient,
+                    booking_id=p.booking_id,
+                    new_slot_id=p.slot_id,
+                    idempotency_key=p.idempotency_key,
+                )
+            )
+            return _complete_booking(state, adapter, appt, ctx, moved=True)
+        appt = adapter.create_appointment(
+            CreateAppointmentCommand(
+                patient=state.patient,
+                slot_id=p.slot_id,
+                idempotency_key=p.idempotency_key,
+            )
+        )
+        return _complete_booking(state, adapter, appt, ctx, moved=False)
+    except AdapterUnavailable:
+        ctx.trace.log("reconcile_still_unknown", slot=p.slot_id)
+        metrics.inc("fallbacks_total")
+        state.phase = Phase.CONFIRM
+        return state, renderer.outcome_unknown()
+    except SlotUnavailable:
+        # No op row existed (dedup would have hit it), yet the slot is taken:
+        # our WRITE never committed. Drop the ghost and recover via re-search.
+        ctx.trace.log("reconcile_stale_pending", slot=p.slot_id)
+        state.pending_operation = None
+        state.selected_slot_id = None
+        slots = _search_booking(state, adapter)
+        state.candidates = [s for s in slots if s.slot.slot_id != p.slot_id][:3]
+        state.phase = Phase.PROPOSE if state.candidates else Phase.ELICIT
+        if not state.candidates:
+            return state, renderer.no_slots()
+        return state, renderer.race_taken() + " " + renderer.propose_slots(state.candidates)
+
+
 def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
     assert state.selected_slot_id
     state.phase = Phase.COMMIT
+    # Key precedence: an explicitly supplied caller key rebinds only a
+    # PREPARED operation (before the first WRITE attempt); an uncertain
+    # operation's key is immutable (mismatched explicit keys are rejected
+    # with 409 before the engine). Otherwise reuse the pending key so
+    # unknown-WRITE retries dedup server-side.
+    pending = state.pending_operation
+    if ctx.idempotency_key_explicit and (
+        pending is None or pending.status == "prepared"
+    ):
+        # Key rebind allowed only before the first WRITE attempt.
+        key = ctx.idempotency_key
+        state.pending_operation = PendingOperation(
+            idempotency_key=key,
+            kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
+            booking_id=state.active_booking_id,
+            slot_id=state.selected_slot_id,
+        )
+    elif pending is not None:
+        # Uncertain (or prepared) operation: the key is immutable from here.
+        key = pending.idempotency_key
+    else:
+        key = ctx.idempotency_key
     try:
         if state.flow == Flow.RESCHEDULE and state.active_booking_id:
             appt = adapter.reschedule_appointment(
@@ -302,35 +428,39 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
                     patient=state.patient,
                     booking_id=state.active_booking_id,
                     new_slot_id=state.selected_slot_id,
-                    idempotency_key=ctx.idempotency_key,
+                    idempotency_key=key,
                 )
             )
-            doctors = {d.doctor_id: d for d in adapter.find_doctors()}
-            d = doctors[appt.doctor_id]
-            ctx.trace.log("booking_moved", booking_id=appt.booking_id)
-            state.phase, state.flow = Phase.IDLE, Flow.NONE
-            state.candidates, state.selected_slot_id = [], None
-            state.active_booking_id = appt.booking_id
-            return state, renderer.moved(appt, d)
+            return _complete_booking(state, adapter, appt, ctx, moved=True)
 
         appt = adapter.create_appointment(
             CreateAppointmentCommand(
                 patient=state.patient,
                 slot_id=state.selected_slot_id,
-                idempotency_key=ctx.idempotency_key,
+                idempotency_key=key,
             )
         )
-        doctors = {d.doctor_id: d for d in adapter.find_doctors()}
-        d = doctors[appt.doctor_id]
-        ctx.trace.log(
-            "booking_created",
-            booking_id=appt.booking_id,
-            slot=state.selected_slot_id,
+        return _complete_booking(state, adapter, appt, ctx, moved=False)
+
+    except AdapterUnavailable:
+        # WRITE outcome unknown: the booking may have committed server-side
+        # while the response was lost. Persist the operation identity so the
+        # next retry reuses the SAME idempotency_key and the backend dedups.
+        # Keep the selected slot as well: if the retry hits a taken slot,
+        # SlotUnavailable recovers via re-search instead of double-booking.
+        from observability import metrics
+
+        ctx.trace.log("commit_outcome_unknown", slot=state.selected_slot_id)
+        metrics.inc("fallbacks_total")
+        state.pending_operation = PendingOperation(
+            idempotency_key=key,
+            kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
+            booking_id=state.active_booking_id,
+            slot_id=state.selected_slot_id,
+            status="uncertain",
         )
-        state.phase, state.flow = Phase.IDLE, Flow.NONE
-        state.candidates, state.selected_slot_id = [], None
-        state.active_booking_id = appt.booking_id
-        return state, renderer.booked(appt, d)
+        state.phase = Phase.CONFIRM
+        return state, renderer.outcome_unknown()
 
     except SlotUnavailable:
         ctx.trace.log("race_taken", slot=state.selected_slot_id)
@@ -346,6 +476,8 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
 
 
 def _on_deny(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: TurnCtx):
+    # NOTE: DENY during an uncertain WRITE never reaches here: step()'s guard
+    # answers pending_unresolved() without mutating state.
     if state.phase in (Phase.PROPOSE, Phase.CONFIRM):
         state.candidates = []
         state.selected_slot_id = None

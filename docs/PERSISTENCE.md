@@ -30,5 +30,30 @@
 
 ## Redis
 
-Отложен в PR4 (распределённые локи + resilience). Сессии переживают
-рестарт уже сейчас через снапшоты; Redis — ускорение, а не условие выживания.
+Снапшоты с TTL + per-patient локи с heartbeat-продлением lease
+(атомарный Lua compare-and-expire — redis-py держит токен thread-local,
+`reacquire()` из другого потока молча умирал). Без Redis — процессные
+локи (только single-replica).
+
+## Fail-safe исходы
+
+- READ-упал → «ничего не записано и не изменено» (честно: мутаций не было).
+- WRITE-упал → «не удалось подтвердить, могла сохраниться». Операция уже
+  имеет durable identity (`pending_operation` создаётся при CONFIRM-выборе):
+  ретрай переиспользует ТОТ ЖЕ `idempotency_key`, backend возвращает
+  исходную запись. Явно переданный ключ API побеждает pending только ДО
+  первого WRITE (статус `prepared`); при `uncertain` ключ immutable —
+  чужой ключ отклоняется с 409 `operation_in_progress`.
+- Пока `uncertain` висит, новые BOOK/RESCHEDULE/CORRECT/DENY не мутируют
+  state (guard в `step()`); CONFIRM идёт в `reconcile_pending()` только по
+  полям pending; STATUS доступен всегда (read-only).
+- Production требует `DBI_PG_URL` всегда и Redis либо `DBI_SINGLE_REPLICA=1.
+- Миграции сериализованы advisory lock; `/ready` проверяет и Redis.
+
+## State authority (реплики)
+
+Локальный `DialogueSession` больше не источник истины: каждый ход идёт
+`lock → load latest → turn → CAS save → unlock` (`sessions/coordinator.py`).
+Конфликт ревизий → `StaleState` → 409/WS-error, перезаписи нет.
+Потеря lease heartbeat'ом видна через `lease.lost`, но решает CAS.
+`/metrics` за `DBI_METRICS_TOKEN` (иначе 404); `/ready` отдаёт только статус.

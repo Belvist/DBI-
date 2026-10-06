@@ -23,8 +23,16 @@ jobs:
         options: >-
           --health-cmd="pg_isready -U postgres"
           --health-interval=5s --health-timeout=3s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=3s --health-retries=10
     env:
       DBI_PG_URL: postgresql://postgres:postgres@localhost:5432/dbi
+      DBI_REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
 
@@ -38,11 +46,58 @@ jobs:
 
       - name: Lint
         run: >-
-          python -m ruff check domain clinic_adapter nlu dialogue api voice
-          observability demo tests identity sessions
+          python -m ruff check config domain clinic_adapter nlu dialogue api
+          voice observability demo tests identity sessions resilience
 
       - name: Unit tests (incl. Postgres parity)
         run: PYTHONPATH=. python -m pytest tests/ -q
 
       - name: Scenario eval
         run: PYTHONPATH=. python -m demo.eval
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+
+      - name: Install wheel into a clean directory and smoke-test
+        run: |
+          python -m pip install dist/*.whl
+          cd /tmp
+          python -c "import api.main, config.settings, identity.providers, sessions.coordinator, resilience.guarded"
+          python -c "from importlib.resources import files; print(list((files('clinic_adapter') / 'migrations').iterdir()))"
+          test -f "$(python -c "from importlib.resources import files; print(files('clinic_adapter') / 'migrations' / '002_idempotency_operations.sql')")"
+
+      - name: Boot installed wheel and run live HTTP+WS checks
+        run: |
+          python -m pip install websockets
+          cd /tmp
+          (python -m uvicorn api.main:app --host 127.0.0.1 --port 18080 > wheel_e2e.log 2>&1 &) 
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:18080/health && break || sleep 1; done
+          curl -sf http://127.0.0.1:18080/ > /dev/null
+          curl -sf http://127.0.0.1:18080/health > /dev/null
+          curl -sf http://127.0.0.1:18080/voice | grep -q "Говорить"
+          curl -sf http://127.0.0.1:18080/ready > /dev/null
+          python - <<'EOF'
+          import asyncio, json
+          from websockets.asyncio.client import connect
+          async def main():
+              async with connect(
+                  "ws://127.0.0.1:18080/voice/ws", subprotocols=["dbi-voice", "demo"]
+              ) as ws:
+                  await ws.send(json.dumps({"type": "user_text", "text": "Запиши меня к неврологу"}))
+                  msg = json.loads(await ws.recv())
+                  assert msg["type"] == "speech", msg
+          asyncio.run(main())
+          EOF
+          pkill -f "uvicorn api.main:app --host 127.0.0.1 --port 18080" || true

@@ -22,6 +22,7 @@ from clinic_adapter.seed_data import ts as _s
 from domain.commands import CreateAppointmentCommand, RescheduleCommand
 from domain.errors import (
     AppointmentNotFound,
+    IdempotencyConflict,
     SlotNotFound,
     SlotUnavailable,
 )
@@ -59,22 +60,40 @@ CREATE TABLE IF NOT EXISTS appointments(
   start TEXT NOT NULL,
   end TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'active',
-  idempotency_key TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS idempotency_operations(
+  patient_id TEXT NOT NULL,
+  operation_kind TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  result_booking_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (patient_id, operation_kind, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_slots_doc_start ON slots(doctor_id, start);
 CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id, status);
+CREATE INDEX IF NOT EXISTS idx_idem_result ON idempotency_operations(result_booking_id);
 """
 
 class MockSqliteClinic:
-    def __init__(self, path: str | Path = ":memory:", seed_base: datetime | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        seed_base: datetime | None = None,
+        seed: bool = True,
+    ) -> None:
         self._path = str(path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
-            if self._conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0] == 0:
+            if (
+                seed
+                and self._conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0] == 0
+            ):
                 self._seed(seed_base or SEED_BASE)
 
     # ---------- seed ----------
@@ -213,20 +232,46 @@ class MockSqliteClinic:
             created_at=_dt(r["created_at"]),
         )
 
-    # ---------- WRITE (atomic) ----------
+    # ---------- WRITE (atomic, scoped idempotency) ----------
+    def _find_op(self, cur, patient_id: str, kind: str, key: str):
+        return cur.execute(
+            "SELECT * FROM idempotency_operations"
+            " WHERE patient_id=? AND operation_kind=? AND idempotency_key=?",
+            (patient_id, kind, key),
+        ).fetchone()
+
+    def _booking_by_id(self, booking_id: str) -> Appointment:
+        row = self._conn.execute(
+            "SELECT * FROM appointments WHERE booking_id=?", (booking_id,)
+        ).fetchone()
+        assert row is not None
+        return self._row_to_appt(row)
+
+    def _resolve_op(self, patient_id: str, kind: str, key: str, fp: str) -> Appointment:
+        op = self._conn.execute(
+            "SELECT * FROM idempotency_operations"
+            " WHERE patient_id=? AND operation_kind=? AND idempotency_key=?",
+            (patient_id, kind, key),
+        ).fetchone()
+        assert op is not None
+        if op["request_hash"] != fp:
+            raise IdempotencyConflict(
+                f"key {key!r} already used for a different {kind} operation"
+            )
+        return self._booking_by_id(op["result_booking_id"])
+
     def create_appointment(self, cmd: CreateAppointmentCommand) -> Appointment:
+        from clinic_adapter.idempotency import fingerprint_create
+
+        fp = fingerprint_create(cmd)
+        pid = cmd.patient.patient_id
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
             try:
-                # idempotency first: replay returns original, no duplicate
-                row = cur.execute(
-                    "SELECT * FROM appointments WHERE idempotency_key=?",
-                    (cmd.idempotency_key,),
-                ).fetchone()
-                if row is not None:
+                if self._find_op(cur, pid, "create", cmd.idempotency_key) is not None:
                     self._conn.commit()
-                    return self._row_to_appt(row)
+                    return self._resolve_op(pid, "create", cmd.idempotency_key, fp)
                 s = cur.execute(
                     "SELECT slot_id, doctor_id, start, end, taken_by FROM slots WHERE slot_id=?",
                     (cmd.slot_id,),
@@ -235,6 +280,11 @@ class MockSqliteClinic:
                     self._conn.rollback()
                     raise SlotNotFound(f"unknown slot {cmd.slot_id}")
                 if s["taken_by"] is not None:
+                    # Same re-check as Postgres: a concurrent same-key retry
+                    # may have committed while we waited on the write lock.
+                    if self._find_op(cur, pid, "create", cmd.idempotency_key) is not None:
+                        self._conn.commit()
+                        return self._resolve_op(pid, "create", cmd.idempotency_key, fp)
                     self._conn.rollback()
                     raise SlotUnavailable(f"slot {cmd.slot_id} just taken")
                 booking_id = "A" + uuid.uuid4().hex[:6].upper()
@@ -244,26 +294,23 @@ class MockSqliteClinic:
                        (booking_id, patient_id, doctor_id, slot_id, start, end, status, idempotency_key, created_at)
                        VALUES(?,?,?,?,?,?,'active',?,?)""",
                     (
-                        booking_id,
-                        cmd.patient.patient_id,
-                        s["doctor_id"],
-                        s["slot_id"],
-                        s["start"],
-                        s["end"],
-                        cmd.idempotency_key,
-                        now,
+                        booking_id, pid, s["doctor_id"], s["slot_id"],
+                        s["start"], s["end"], cmd.idempotency_key, now,
                     ),
                 )
                 cur.execute(
+                    """INSERT INTO idempotency_operations
+                       (patient_id, operation_kind, idempotency_key,
+                        request_hash, result_booking_id, created_at)
+                       VALUES(?,'create',?,?,?,?)""",
+                    (pid, cmd.idempotency_key, fp, booking_id, now),
+                )
+                cur.execute(
                     "UPDATE slots SET taken_by=? WHERE slot_id=?",
-                    (cmd.patient.patient_id, cmd.slot_id),
+                    (pid, cmd.slot_id),
                 )
                 self._conn.commit()
-                row2 = self._conn.execute(
-                    "SELECT * FROM appointments WHERE booking_id=?", (booking_id,)
-                ).fetchone()
-                assert row2 is not None
-                return self._row_to_appt(row2)
+                return self._booking_by_id(booking_id)
             except Exception:
                 try:
                     self._conn.rollback()
@@ -272,25 +319,25 @@ class MockSqliteClinic:
                 raise
 
     def reschedule_appointment(self, cmd: RescheduleCommand) -> Appointment:
+        from clinic_adapter.idempotency import fingerprint_reschedule
+
+        fp = fingerprint_reschedule(cmd)
+        pid = cmd.patient.patient_id
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
             try:
-                row = cur.execute(
-                    "SELECT * FROM appointments WHERE idempotency_key=?",
-                    (cmd.idempotency_key,),
-                ).fetchone()
-                if row is not None:
+                if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
                     self._conn.commit()
-                    return self._row_to_appt(row)
+                    return self._resolve_op(pid, "reschedule", cmd.idempotency_key, fp)
                 old = cur.execute(
                     "SELECT * FROM appointments WHERE booking_id=? AND patient_id=?",
-                    (cmd.booking_id, cmd.patient.patient_id),
+                    (cmd.booking_id, pid),
                 ).fetchone()
-                if old is None:
-                    self._conn.rollback()
-                    raise AppointmentNotFound(f"unknown booking {cmd.booking_id}")
-                if old["status"] != AppointmentStatus.ACTIVE.value:
+                if old is None or old["status"] != AppointmentStatus.ACTIVE.value:
+                    if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                        self._conn.commit()
+                        return self._resolve_op(pid, "reschedule", cmd.idempotency_key, fp)
                     self._conn.rollback()
                     raise AppointmentNotFound(f"booking {cmd.booking_id} not active")
                 tgt = cur.execute(
@@ -301,13 +348,16 @@ class MockSqliteClinic:
                     self._conn.rollback()
                     raise SlotNotFound(f"unknown slot {cmd.new_slot_id}")
                 if tgt["taken_by"] is not None:
+                    if self._find_op(cur, pid, "reschedule", cmd.idempotency_key) is not None:
+                        self._conn.commit()
+                        return self._resolve_op(pid, "reschedule", cmd.idempotency_key, fp)
                     self._conn.rollback()
                     raise SlotUnavailable(f"slot {cmd.new_slot_id} just taken")
                 # free old slot, take new one, mark old appt moved, insert new appt
                 cur.execute("UPDATE slots SET taken_by=NULL WHERE slot_id=?", (old["slot_id"],))
                 cur.execute(
                     "UPDATE slots SET taken_by=? WHERE slot_id=?",
-                    (cmd.patient.patient_id, cmd.new_slot_id),
+                    (pid, cmd.new_slot_id),
                 )
                 cur.execute(
                     "UPDATE appointments SET status='moved' WHERE booking_id=?",
@@ -320,22 +370,19 @@ class MockSqliteClinic:
                        (booking_id, patient_id, doctor_id, slot_id, start, end, status, idempotency_key, created_at)
                        VALUES(?,?,?,?,?,?,'active',?,?)""",
                     (
-                        new_id,
-                        cmd.patient.patient_id,
-                        tgt["doctor_id"],
-                        tgt["slot_id"],
-                        tgt["start"],
-                        tgt["end"],
-                        cmd.idempotency_key,
-                        now,
+                        new_id, pid, tgt["doctor_id"], tgt["slot_id"],
+                        tgt["start"], tgt["end"], cmd.idempotency_key, now,
                     ),
                 )
+                cur.execute(
+                    """INSERT INTO idempotency_operations
+                       (patient_id, operation_kind, idempotency_key,
+                        request_hash, result_booking_id, created_at)
+                       VALUES(?,'reschedule',?,?,?,?)""",
+                    (pid, cmd.idempotency_key, fp, new_id, now),
+                )
                 self._conn.commit()
-                row2 = self._conn.execute(
-                    "SELECT * FROM appointments WHERE booking_id=?", (new_id,)
-                ).fetchone()
-                assert row2 is not None
-                return self._row_to_appt(row2)
+                return self._booking_by_id(new_id)
             except Exception:
                 try:
                     self._conn.rollback()
@@ -344,30 +391,29 @@ class MockSqliteClinic:
                 raise
 
     def purge_stale_idempotency_keys(self, older_than_days: int = 30) -> int:
-        """Retire idempotency keys of NON-ACTIVE appointments older than N days.
+        """Delete op rows whose result booking is NON-ACTIVE and old.
 
-        The appointment rows stay for audit; only the dedup key is rewritten,
-        so the UNIQUE budget does not grow forever. ACTIVE bookings are never
-        touched: a late retry must still dedup instead of double-booking.
-        Returns the number of retired keys.
+        Appointment rows stay for audit. ACTIVE bookings are never touched:
+        a late retry must still dedup instead of double-booking.
         """
         from datetime import datetime as _now
 
         cutoff = _s(_now.now() - timedelta(days=older_than_days))
         with self._lock:
-            rows = self._conn.execute(
-                """SELECT booking_id, idempotency_key FROM appointments
-                   WHERE status != 'active' AND created_at < ?
-                   AND idempotency_key NOT LIKE 'purged:%'""",
+            cur = self._conn.execute(
+                """DELETE FROM idempotency_operations WHERE result_booking_id IN (
+                     SELECT booking_id FROM appointments
+                     WHERE status != 'active' AND created_at < ?
+                   )""",
                 (cutoff,),
-            ).fetchall()
-            for r in rows:
-                self._conn.execute(
-                    "UPDATE appointments SET idempotency_key=? WHERE booking_id=?",
-                    (f"purged:{r['booking_id']}", r["booking_id"]),
-                )
+            )
             self._conn.commit()
-            return len(rows)
+            return cur.rowcount
+
+    def ping(self) -> None:
+        """Lightweight health check - does not mutate state."""
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
 
     # test-only helper: simulate a race by taking a slot out-of-band
     def steal_slot(self, slot_id: str, by: str = "other_patient") -> None:

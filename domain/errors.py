@@ -42,6 +42,16 @@ class HallucinatedResponse(ClinicError):
     code = "hallucinated_response"
 
 
+class IdempotencyConflict(ClinicError):
+    """Same (patient, kind, key) but a DIFFERENT operation payload.
+
+    The caller is reusing a key for a new operation. Never silently return
+    the old result and never execute: surface 409 and require a fresh key.
+    """
+
+    code = "idempotency_conflict"
+
+
 class UnknownIdentity(ClinicError):
     """Credential identifies nobody. Fail closed: no patient, no data."""
 

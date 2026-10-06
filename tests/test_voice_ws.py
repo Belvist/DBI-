@@ -22,9 +22,9 @@ AUTH = {"subprotocols": ["dbi-voice", "demo"]}
 
 @pytest.fixture(autouse=True)
 def _fresh_dialogue():
-    api_main._SESSIONS.clear()
+    api_main._SNAPSHOTS.drop("demo-patient")
     yield
-    api_main._SESSIONS.clear()
+    api_main._SNAPSHOTS.drop("demo-patient")
 
 
 def test_ws_rejects_anonymous():
@@ -62,11 +62,10 @@ def test_ws_barge_in_cancels_generation():
         ws.send_json({"type": "barge_in"})
         ack = ws.receive_json()
         assert ack["type"] == "stopped"
-        kinds = [
-            e.kind
-            for e in api_main._SESSIONS["demo-patient"].trace.events
-        ]
-        assert "barge_in" in kinds
+        # connection survives barge-in: next turn runs on rebound session
+        ws.send_json({"type": "user_text", "text": "На следующей неделе вечером"})
+        m = ws.receive_json()
+        assert m["type"] == "speech" and m["flow"] == "book"
 
 
 def test_ws_unknown_message():

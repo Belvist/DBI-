@@ -24,17 +24,27 @@ Message protocol (JSON, client <-> server):
 Barge-in semantics mirror `voice/runtime.py`: the in-flight generation is
 cancelled server-side; the browser ALSO cancels speechSynthesis locally so
 the stop is instant even before the round-trip completes.
+
+Concurrency: the dialogue turn (lock + session.turn + adapter I/O + save) is
+blocking sync code and runs in a worker thread via anyio.to_thread, so a
+slow DB never stalls the event loop. `Generation.cancel` is a single
+GIL-atomic flag store, safe to flip from the loop thread mid-turn.
 """
 from __future__ import annotations
 
 import re
 import time
 
+import anyio.to_thread
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api.booking_service import DialogueSession
-from domain.errors import UnknownIdentity
+from domain.adapter_errors import DependencyUnavailable
+from domain.errors import IdempotencyConflict, UnknownIdentity
+from domain.models import PatientRef
 from identity.providers import IdentityContext
+from sessions.coordinator import run_turn
+from sessions.errors import OperationInProgress, StaleState
 from voice.runtime import VoiceRuntime
 
 router = APIRouter()
@@ -62,7 +72,6 @@ async def voice_ws(ws: WebSocket) -> None:
     await ws.accept(subprotocol=PROTOCOL)
     session: DialogueSession = ws.app.state.session_factory(patient)
     runtime = VoiceRuntime(session)
-    snapshots = ws.app.state.snapshots
     try:
         while True:
             msg = await ws.receive_json()
@@ -74,26 +83,59 @@ async def voice_ws(ws: WebSocket) -> None:
                 gen = runtime.current.gen_id if runtime.current else None
                 await ws.send_json({"type": "stopped", "gen_id": gen})
             elif kind == "user_text":
-                text = str(msg.get("text", ""))
-                t0 = time.monotonic()
-                speech, gen = runtime.on_user_text(text)
-                t_ms = int((time.monotonic() - t0) * 1000)
-                snapshots.save(session.state)
-                if gen.cancelled or not speech:
-                    await ws.send_json({"type": "superseded", "gen_id": gen.gen_id})
-                else:
-                    await ws.send_json(
-                        {
-                            "type": "speech",
-                            "gen_id": gen.gen_id,
-                            "text": speech,
-                            "phase": session.state.phase.value,
-                            "flow": session.state.flow.value,
-                            "booking_id": session.state.active_booking_id,
-                            "t_ms": t_ms,
-                        }
-                    )
+                reply = await anyio.to_thread.run_sync(
+                    _do_turn, ws.app.state, patient, runtime, str(msg.get("text", ""))
+                )
+                await ws.send_json(reply)
             else:
                 await ws.send_json({"type": "error", "detail": f"unknown: {kind}"})
     except WebSocketDisconnect:
         return
+
+
+def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime, text: str) -> dict:
+    """One blocking dialogue turn on authoritative state. Runs in a worker thread.
+
+    The session is rebuilt from the snapshot store on EVERY turn: a
+    long-lived WS connection never trusts a stale local DialogueSession.
+    """
+    from voice.runtime import Generation
+
+    t0 = time.monotonic()
+    gen = Generation()
+    runtime.current = gen
+    runtime.user_is_speaking = False
+    try:
+        speech, sess = run_turn(
+            patient=patient,
+            text=text,
+            idempotency_key=None,
+            adapter=runtime.session.adapter,
+            snapshots=app_state.snapshots,
+            redis_url=app_state.redis_url,
+            now=app_state.clock.now(),
+        )
+    except StaleState:
+        return {"type": "error", "detail": "concurrent turn, please repeat"}
+    except DependencyUnavailable:
+        return {"type": "error", "detail": "service temporarily unavailable, please retry"}
+    except IdempotencyConflict:
+        return {"type": "error", "detail": "operation key conflict, use a fresh key"}
+    except OperationInProgress:
+        return {"type": "error", "detail": "operation in progress, retry with the same key"}
+    runtime.session = sess  # rebind: barge-in trace follows the latest session
+    runtime.trace = sess.trace
+    t_ms = int((time.monotonic() - t0) * 1000)
+    if gen.cancelled or not speech:
+        runtime.trace.log("gen_superseded", gen_id=gen.gen_id)
+        return {"type": "superseded", "gen_id": gen.gen_id}
+    runtime.trace.log("assistant_speech", gen_id=gen.gen_id, text=speech[:160])
+    return {
+        "type": "speech",
+        "gen_id": gen.gen_id,
+        "text": speech,
+        "phase": sess.state.phase.value,
+        "flow": sess.state.flow.value,
+        "booking_id": sess.state.active_booking_id,
+        "t_ms": t_ms,
+    }

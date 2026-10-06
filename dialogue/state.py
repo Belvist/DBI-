@@ -1,8 +1,10 @@
 """Dialogue state — what is true. Owned by code, not by LLM."""
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -26,6 +28,27 @@ class Flow(str, Enum):
     SCHEDULE = "schedule"
 
 
+class PendingOperation(BaseModel):
+    """Durable identity of an in-flight clinic WRITE.
+
+    Created BEFORE the adapter call; if the outcome is unknown, the next
+    retry MUST reuse the same idempotency_key so the backend dedups instead
+    of double-booking.
+    """
+
+    operation_id: str = Field(
+        default_factory=lambda: "op-" + uuid.uuid4().hex[:12]
+    )
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    kind: Literal["create", "reschedule"]
+    booking_id: str | None = None  # set for reschedule (the booking being moved)
+    slot_id: str = Field(min_length=1)  # target slot
+    # prepared: chosen, WRITE not yet sent (key still rebindable).
+    # uncertain: WRITE sent, outcome unknown (key IMMUTABLE, new conflicting
+    #   WRITEs blocked until reconciled).
+    status: Literal["prepared", "uncertain"] = "prepared"
+
+
 class DialogueState(BaseModel):
     patient: PatientRef
     phase: Phase = Phase.IDLE
@@ -40,3 +63,7 @@ class DialogueState(BaseModel):
     active_booking_id: str | None = None
     last_error: str | None = None
     turn: int = 0
+    # Snapshot fencing: incremented on every authoritative save. The snapshot
+    # store is the source of truth across replicas; this counter is its CAS.
+    revision: int = 0
+    pending_operation: PendingOperation | None = None
