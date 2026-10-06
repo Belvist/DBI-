@@ -117,6 +117,23 @@ def temporarily_unavailable() -> str:
     )
 
 
+def pending_blocked() -> str:
+    return (
+        "Подождите: у нас осталась неподтверждённая запись — я не знаю, "
+        "сохранилась она или нет. Сначала проверим её: скажите «да», "
+        "и я проверю тот же вариант. Новое время подберём после этого."
+    )
+
+
+def pending_unresolved() -> str:
+    return (
+        "Поняла, но тут важный момент: предыдущая запись могла сохраниться, "
+        "несмотря на сбой. Я не стану её отменять или заменять вслепую. "
+        "Скажите «да», чтобы я проверил тот вариант, или спросите "
+        "«когда я записан», и разберёмся по фактам."
+    )
+
+
 def outcome_unknown() -> str:
     # WRITE-path failure: the booking MAY have committed server-side while
     # the response was lost. Claiming "nothing was recorded" would be a lie.

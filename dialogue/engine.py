@@ -293,10 +293,23 @@ def _pick_candidate(state: DialogueState, nlu: NLUResult) -> int:
     return 0
 
 
+def _uncertain_pending(state: DialogueState):
+    pending = state.pending_operation
+    if pending is not None and pending.status == "uncertain":
+        return pending
+    return None
+
+
 def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: TurnCtx):
     if state.phase == Phase.PROPOSE and state.candidates:
         idx = _pick_candidate(state, nlu)
         sel = state.candidates[idx]
+        uncertain = _uncertain_pending(state)
+        if uncertain is not None and sel.slot.slot_id != uncertain.slot_id:
+            # An uncertain WRITE is unresolved: starting a new conflicting
+            # operation now could double-book. Reconcile first.
+            ctx.trace.log("pending_blocked", slot=sel.slot.slot_id)
+            return state, renderer.pending_blocked()
         state.selected_slot_id = sel.slot.slot_id
         state.phase = Phase.CONFIRM
         # Create pending operation with stable idempotency_key for this COMMIT
@@ -310,6 +323,9 @@ def _on_confirm(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ct
         return state, renderer.confirm_slot(sel)
 
     if state.phase == Phase.CONFIRM and state.selected_slot_id:
+        uncertain = _uncertain_pending(state)
+        if uncertain is not None and state.selected_slot_id != uncertain.slot_id:
+            return state, renderer.pending_blocked()
         return _commit(state, adapter, ctx)
 
     return _on_unknown(state, nlu, adapter, ctx)
@@ -323,7 +339,10 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
     # key is reused so unknown-WRITE retries dedup server-side; only with
     # neither do we fall back to this turn's generated key.
     pending = state.pending_operation
-    if ctx.idempotency_key_explicit:
+    if ctx.idempotency_key_explicit and (
+        pending is None or pending.status == "prepared"
+    ):
+        # Key rebind allowed only before the first WRITE attempt.
         key = ctx.idempotency_key
         state.pending_operation = PendingOperation(
             idempotency_key=key,
@@ -332,6 +351,7 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
             slot_id=state.selected_slot_id,
         )
     elif pending is not None:
+        # Uncertain (or prepared) operation: the key is immutable from here.
         key = pending.idempotency_key
     else:
         key = ctx.idempotency_key
@@ -389,6 +409,7 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
             kind="reschedule" if state.flow == Flow.RESCHEDULE else "create",
             booking_id=state.active_booking_id,
             slot_id=state.selected_slot_id,
+            status="uncertain",
         )
         state.phase = Phase.CONFIRM
         return state, renderer.outcome_unknown()
@@ -407,6 +428,11 @@ def _commit(state: DialogueState, adapter: ClinicAdapter, ctx: TurnCtx):
 
 
 def _on_deny(state: DialogueState, nlu: NLUResult, adapter: ClinicAdapter, ctx: TurnCtx):
+    if _uncertain_pending(state) is not None:
+        # "Нет" does not cancel an uncertain WRITE: the booking may exist.
+        # Keep everything; guide the user to reconcile first.
+        ctx.trace.log("deny_during_uncertain")
+        return state, renderer.pending_unresolved()
     if state.phase in (Phase.PROPOSE, Phase.CONFIRM):
         state.candidates = []
         state.selected_slot_id = None

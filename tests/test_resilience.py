@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 from api.booking_service import DialogueSession
@@ -209,6 +210,65 @@ def _drive_to_confirm(sess):
     assert sess.state.candidates
     sess.turn("Первый вариант")
     assert sess.state.phase.value == "confirm"
+
+
+def test_deny_during_uncertain_never_abandons_operation():
+    sqlite = MockSqliteClinic()
+    flaky = CommitThenDrop(sqlite)
+    sess = DialogueSession(
+        PatientRef(patient_id="p-deny-unc"), ResilientAdapter(flaky), now=NOW
+    )
+    _drive_to_confirm(sess)
+    assert "не удалось подтвердить" in sess.turn("Да").lower()
+    assert sess.state.pending_operation.status == "uncertain"
+
+    # "Нет" must not wipe the uncertain operation
+    deny = sess.turn("Нет, вторник вообще не могу")
+    assert "могла сохраниться" in deny.lower() or "неподтвержд" in deny.lower()
+    assert sess.state.pending_operation is not None
+    assert sess.state.pending_operation.status == "uncertain"
+
+    # starting a new booking and confirming another slot is blocked
+    flaky.drop = False
+    sess.turn("Запиши меня к кардиологу на следующей неделе")
+    assert sess.state.candidates
+    blocked = sess.turn("Первый вариант")
+    assert "неподтвержд" in blocked.lower()
+    assert len(sqlite.get_appointments(sess.patient)) == 1
+
+
+def test_explicit_key_rebind_during_uncertain_is_409(tmp_path):
+    from sessions.coordinator import run_turn
+    from sessions.store import SessionStore
+
+    sqlite = MockSqliteClinic()
+    flaky = CommitThenDrop(sqlite)
+    guarded = ResilientAdapter(flaky)
+    store = SessionStore(tmp_path / "s.sqlite")
+    patient = PatientRef(patient_id="p-409")
+    sess = DialogueSession(patient, guarded, now=NOW)
+    _drive_to_confirm(sess)
+    sess.turn("Да")
+    assert sess.state.pending_operation.status == "uncertain"
+    store.save(sess.state)
+
+    from sessions.errors import OperationInProgress
+
+    with pytest.raises(OperationInProgress):
+        run_turn(
+            patient=patient, text="Да", idempotency_key="ik-brand-new",
+            adapter=guarded, snapshots=store,
+            redis_url="", now=NOW,
+        )
+    # same key reconciles instead (backend recovered)
+    flaky.drop = False
+    speech, _ = run_turn(
+        patient=patient, text="Да",
+        idempotency_key=sess.state.pending_operation.idempotency_key,
+        adapter=guarded, snapshots=store,
+        redis_url="", now=NOW,
+    )
+    assert "записаны" in speech.lower()
 
 
 def test_ready_503_when_snapshots_die_after_startup(monkeypatch):

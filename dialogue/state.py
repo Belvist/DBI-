@@ -43,7 +43,10 @@ class PendingOperation(BaseModel):
     kind: Literal["create", "reschedule"]
     booking_id: str | None = None  # set for reschedule (the booking being moved)
     slot_id: str = Field(min_length=1)  # target slot
-    status: Literal["unknown"] = "unknown"
+    # prepared: chosen, WRITE not yet sent (key still rebindable).
+    # uncertain: WRITE sent, outcome unknown (key IMMUTABLE, new conflicting
+    #   WRITEs blocked until reconciled).
+    status: Literal["prepared", "uncertain"] = "prepared"
 
 
 class DialogueState(BaseModel):

@@ -44,7 +44,7 @@ from domain.errors import IdempotencyConflict, UnknownIdentity
 from domain.models import PatientRef
 from identity.providers import IdentityContext
 from sessions.coordinator import run_turn
-from sessions.errors import StaleState
+from sessions.errors import OperationInProgress, StaleState
 from voice.runtime import VoiceRuntime
 
 router = APIRouter()
@@ -121,6 +121,8 @@ def _do_turn(app_state, patient: PatientRef, runtime: VoiceRuntime, text: str) -
         return {"type": "error", "detail": "service temporarily unavailable, please retry"}
     except IdempotencyConflict:
         return {"type": "error", "detail": "operation key conflict, use a fresh key"}
+    except OperationInProgress:
+        return {"type": "error", "detail": "operation in progress, retry with the same key"}
     runtime.session = sess  # rebind: barge-in trace follows the latest session
     runtime.trace = sess.trace
     t_ms = int((time.monotonic() - t0) * 1000)

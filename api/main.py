@@ -66,7 +66,7 @@ def _turn_locked(
     patient: PatientRef, text: str, idempotency_key: str | None
 ) -> tuple[str, DialogueSession]:
     from domain.adapter_errors import DependencyUnavailable
-    from sessions.errors import StaleState
+    from sessions.errors import OperationInProgress, StaleState
 
     try:
         return run_turn(
@@ -82,8 +82,11 @@ def _turn_locked(
         raise HTTPException(status_code=409, detail=f"concurrent turn: {e}") from None
     except TimeoutError as e:
         raise HTTPException(status_code=409, detail=str(e)) from None
-    except DependencyUnavailable as e:
-        raise HTTPException(status_code=503, detail=str(e)) from None
+    except DependencyUnavailable:
+        # Generic client message; full cause stays in server logs/traces.
+        raise HTTPException(status_code=503, detail="service temporarily unavailable") from None
+    except OperationInProgress as e:
+        raise HTTPException(status_code=409, detail=f"operation_in_progress: {e}") from None
 
 
 app.state.session_factory = _session
