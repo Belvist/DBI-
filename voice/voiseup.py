@@ -77,14 +77,15 @@ class VoiseupTTS:
     def describe(self) -> str:
         return f"voiseup-qwen at {self.base_url}"
 
-    def synthesize(self, text: str) -> tuple[int, bytes]:
-        """Returns (sample_rate, concatenated PCM16 bytes)."""
+    def synthesize(self, text: str) -> tuple[int, bytes, str]:
+        """Returns (sample_rate, concatenated PCM16 bytes, generation_id)."""
         if not text or not text.strip():
             raise VoiceEngineError("empty text")
+        gen_id = f"g-{uuid.uuid4().hex[:8]}"
         status, raw = _post_json(
             f"{self.base_url}/v1/synthesize",
             {"call_id": f"dbi-{uuid.uuid4().hex[:8]}",
-             "generation_id": f"g-{uuid.uuid4().hex[:8]}",
+             "generation_id": gen_id,
              "phrase_id": f"p-{uuid.uuid4().hex[:8]}",
              "text": text[:2000], "language": "ru"},
             self.timeout,
@@ -111,4 +112,15 @@ class VoiseupTTS:
                 chunks.append(base64.b64decode(item["pcm_b64"]))
         if not chunks:
             raise VoiceEngineError("tts produced no audio")
-        return rate, b"".join(chunks)
+        return rate, b"".join(chunks), gen_id
+
+    def cancel(self, generation_id: str) -> None:
+        """Best-effort server-side TTS cancellation (barge-in)."""
+        try:
+            _post_json(
+                f"{self.base_url}/v1/cancel",
+                {"generation_id": generation_id},
+                timeout=5.0,
+            )
+        except VoiceEngineError as e:
+            log.debug("tts cancel failed: %s", e)

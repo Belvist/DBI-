@@ -63,9 +63,10 @@ def test_stt_transcribes_real_utterance():
 
 @needs_tts
 def test_tts_synthesizes_russian():
-    rate, pcm = VoiseupTTS(TTS_URL, timeout=90).synthesize("Здравствуйте!")
+    rate, pcm, gen_id = VoiseupTTS(TTS_URL, timeout=90).synthesize("Здравствуйте!")
     assert rate in (16000, 22050, 24000, 44100, 48000)
     assert len(pcm) > 1000 and len(pcm) % 2 == 0
+    assert gen_id.startswith("g-")
 
 
 @needs_stt

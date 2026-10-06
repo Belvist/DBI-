@@ -39,8 +39,13 @@ class DialogueSession:
         import re
 
         metrics.inc("turns_total")
-        user_times = set(re.findall(r"(?<!\d)(\d{1,2}:\d{2})(?!\d)", text))
         det_out = det.parse(text, now=self.now)
+        # Times the user SAID ("в 8 вечера" -> exact 20:00) may be echoed
+        # back in a negation. Digits alone miss word forms, so union the
+        # parsed exact time too.
+        user_times = set(re.findall(r"(?<!\d)(\d{1,2}:\d{2})(?!\d)", text))
+        if det_out.exact_time:
+            user_times.add(det_out.exact_time)
         fused = fuse(det_out, self.proposer.propose(text, self.now))
         ctx = TurnCtx(now=self.now, trace=self.trace)
         if idempotency_key:

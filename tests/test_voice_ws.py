@@ -96,5 +96,5 @@ def test_provider_contracts():
 
 def test_voice_page_served():
     r = client.get("/voice")
-    assert r.status_code == 200 and "Говорить" in r.text
-    assert "/voice/transcribe" in r.text and "/voice/speak" in r.text
+    assert r.status_code == 200 and "Позвонить" in r.text
+    assert "/voice/ws-call" in r.text

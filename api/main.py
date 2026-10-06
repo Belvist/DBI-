@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from api.booking_service import DialogueSession
+from api.voice_call import router as voice_call_router
 from api.voice_ws import router as voice_router
 from clinic_adapter.mock_sqlite import MockSqliteClinic
 from clinic_adapter.postgres import PostgresClinic
@@ -23,8 +24,9 @@ from sessions.store import SessionStore
 
 log = logging.getLogger("dbi.api")
 
-app = FastAPI(title="DBI Clinic Assistant", version="0.2.0")
+app = FastAPI(title="DBI Clinic Assistant", version="0.3.0")
 app.include_router(voice_router)
+app.include_router(voice_call_router)
 
 _SETTINGS = load_settings()
 if _SETTINGS.pg_url:
@@ -95,6 +97,9 @@ app.state.identity = _IDENTITY
 app.state.snapshots = _SNAPSHOTS
 app.state.redis_url = _SETTINGS.redis_url
 app.state.clock = _CLOCK
+app.state.session_adapter = lambda: _ADAPTER
+app.state.voice_stt_url = _SETTINGS.voice_stt_url
+app.state.voice_tts_url = _SETTINGS.voice_tts_url
 app.state.base_adapter = _BASE
 
 
@@ -244,7 +249,7 @@ def voice_speak(
             metrics.inc("auth_failures_total")
         raise
     try:
-        rate, pcm = VoiseupTTS(_SETTINGS.voice_tts_url).synthesize(str(body.get("text", "")))
+        rate, pcm, _ = VoiseupTTS(_SETTINGS.voice_tts_url).synthesize(str(body.get("text", "")))
     except VoiceEngineError as e:
         raise HTTPException(status_code=503, detail="speech synthesis unavailable") from e
     buf = io.BytesIO()
