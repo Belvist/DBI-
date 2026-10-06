@@ -1,7 +1,7 @@
 PYTHON = PYTHONPATH=. python3
 export PYTHONPATH := .
 
-.PHONY: up down test demo lint eval
+.PHONY: up down test demo lint eval check
 
 up:
 	docker compose up -d --build || ($(PYTHON) -m uvicorn api.main:app --host 127.0.0.1 --port 8080 &)
@@ -20,4 +20,6 @@ eval:
 	$(PYTHON) -m demo.eval
 
 lint:
-	$(PYTHON) -m ruff check domain clinic_adapter nlu dialogue api voice observability demo tests || true
+	$(PYTHON) -m ruff check domain clinic_adapter nlu dialogue api voice observability demo tests
+
+check: lint test
