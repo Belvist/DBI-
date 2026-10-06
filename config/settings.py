@@ -55,6 +55,7 @@ def load(env: dict[str, str] | None = None) -> Settings:
     pg_url = src.get("DBI_PG_URL", "")
     redis_url = src.get("DBI_REDIS_URL", "")
     single_replica = src.get("DBI_SINGLE_REPLICA", "") == "1"
+    metrics_token = src.get("DBI_METRICS_TOKEN", "")
     if mode == "production":
         if not pg_url:
             raise RuntimeError("DBI_ENV=production requires DBI_PG_URL (no ephemeral DB)")
@@ -62,6 +63,10 @@ def load(env: dict[str, str] | None = None) -> Settings:
             raise RuntimeError(
                 "DBI_ENV=production requires DBI_REDIS_URL "
                 "or explicit DBI_SINGLE_REPLICA=1"
+            )
+        if not metrics_token:
+            raise RuntimeError(
+                "DBI_ENV=production requires DBI_METRICS_TOKEN (/metrics must not be public)"
             )
     return Settings(
         env=mode,
@@ -73,6 +78,6 @@ def load(env: dict[str, str] | None = None) -> Settings:
         sessions_path=src.get("DBI_SESSIONS_PATH", ":memory:"),
         redis_url=redis_url,
         single_replica=single_replica,
-        metrics_token=src.get("DBI_METRICS_TOKEN", ""),
+        metrics_token=metrics_token,
         allow_seed=allow_seed,
     )

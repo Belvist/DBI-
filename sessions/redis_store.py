@@ -23,7 +23,10 @@ _CAS_LUA = """
 local raw = redis.call('get', KEYS[1])
 local exp = tonumber(ARGV[1])
 if raw then
-  if cjson.decode(raw).revision ~= exp then return -1 end
+  -- legacy v1 snapshots carry no top-level revision: treat as 0 so they
+  -- migrate forward instead of wedging on StaleState forever.
+  local current = tonumber(cjson.decode(raw).revision or 0)
+  if current ~= exp then return -1 end
 elseif exp ~= 0 then return -1 end
 redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3])
 return exp + 1

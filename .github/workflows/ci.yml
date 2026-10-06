@@ -54,3 +54,26 @@ jobs:
 
       - name: Scenario eval
         run: PYTHONPATH=. python -m demo.eval
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+
+      - name: Install wheel into a clean directory and smoke-test
+        run: |
+          python -m pip install dist/*.whl
+          cd /tmp
+          python -c "import api.main, config.settings, identity.providers, sessions.coordinator, resilience.guarded"
+          python -c "from importlib.resources import files; print(list((files('clinic_adapter') / 'migrations').iterdir()))"
+          test -f "$(python -c "from importlib.resources import files; print(files('clinic_adapter') / 'migrations' / '002_idempotency_operations.sql')")"

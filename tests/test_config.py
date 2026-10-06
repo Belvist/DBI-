@@ -25,7 +25,14 @@ def test_production_forbids_seed_even_explicit():
 def _prod_base():
     return {"DBI_ENV": "production", "DBI_IDENTITY": "tokenfile",
             "DBI_TOKENS_FILE": "t.json", "DBI_PG_URL": "postgresql://x/y",
-            "DBI_REDIS_URL": "redis://x/0"}
+            "DBI_REDIS_URL": "redis://x/0", "DBI_METRICS_TOKEN": "tok"}
+
+
+def test_production_requires_metrics_token():
+    env = _prod_base()
+    del env["DBI_METRICS_TOKEN"]
+    with pytest.raises(RuntimeError):
+        load(env)
 
 
 def test_production_ok_with_tokenfile():

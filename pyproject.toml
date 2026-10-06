@@ -24,14 +24,21 @@ where = ["."]
 include = [
   "api*",
   "clinic_adapter*",
+  "config*",
   "demo*",
   "dialogue*",
   "domain*",
+  "identity*",
   "nlu*",
   "observability*",
+  "resilience*",
+  "sessions*",
   "voice*",
 ]
 exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+clinic_adapter = ["migrations/*.sql"]
 
 [tool.ruff]
 line-length = 100

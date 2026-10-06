@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-DEFAULT_DIR = Path(__file__).resolve().parent.parent / "migrations"
+DEFAULT_DIR = Path(__file__).resolve().parent / "migrations"
 
 
 def pending(conn, directory: Path | str = DEFAULT_DIR) -> list[Path]:
