@@ -16,6 +16,9 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from clinic_adapter.seed_data import SEED_BASE, SEED_DOCTORS, seed_slots
+from clinic_adapter.seed_data import dt as _dt
+from clinic_adapter.seed_data import ts as _s
 from domain.commands import CreateAppointmentCommand, RescheduleCommand
 from domain.errors import (
     AppointmentNotFound,
@@ -63,26 +66,6 @@ CREATE INDEX IF NOT EXISTS idx_slots_doc_start ON slots(doctor_id, start);
 CREATE INDEX IF NOT EXISTS idx_appt_patient ON appointments(patient_id, status);
 """
 
-_SEED_DOCTORS: list[tuple[str, str, str, Specialty]] = [
-    ("d_petrova", "Петрова Анна Сергеевна", "Петрова А.С.", Specialty.NEUROLOGY),
-    ("d_ivanov", "Иванов Игорь Петрович", "Иванов И.П.", Specialty.CARDIOLOGY),
-    ("d_sidorova", "Сидорова Мария Ивановна", "Сидорова М.И.", Specialty.THERAPY),
-    ("d_kozlov", "Козлов Дмитрий Андреевич", "Козлов Д.А.", Specialty.CARDIOLOGY),
-    ("d_smirnova", "Смирнова Ольга Викторовна", "Смирнова О.В.", Specialty.THERAPY),
-    ("d_fedorov", "Федоров Сергей Николаевич", "Федоров С.Н.", Specialty.NEUROLOGY),
-]
-
-_FMT = "%Y-%m-%dT%H:%M"
-
-
-def _dt(s: str) -> datetime:
-    return datetime.strptime(s, _FMT)
-
-
-def _s(dt: datetime) -> str:
-    return dt.strftime(_FMT)
-
-
 class MockSqliteClinic:
     def __init__(self, path: str | Path = ":memory:", seed_base: datetime | None = None) -> None:
         self._path = str(path)
@@ -92,31 +75,22 @@ class MockSqliteClinic:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             if self._conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0] == 0:
-                self._seed(seed_base or datetime(2026, 10, 12, 9, 0))
+                self._seed(seed_base or SEED_BASE)
 
     # ---------- seed ----------
     def _seed(self, base_monday: datetime) -> None:
-        for doctor_id, full, short, spec in _SEED_DOCTORS:
+        # Every doctor gets every slot: guarantees demo/eval coverage for any
+        # specialty on any weekday. Real sparsity comes from bookings.
+        for doctor_id, full, short, spec in SEED_DOCTORS:
             self._conn.execute(
                 "INSERT INTO doctors(doctor_id, full_name, short_name, specialty) VALUES(?,?,?,?)",
                 (doctor_id, full, short, spec.value),
             )
-        # Two weeks of slots: Mon-Fri, morning 09:00-12:00 + evening 18:00-20:00.
-        # Every doctor gets every slot: guarantees demo/eval coverage for any
-        # specialty on any weekday. Real sparsity comes from bookings.
-        for day_off in range(14):
-            day = base_monday + timedelta(days=day_off)
-            if day.weekday() >= 5:
-                continue
-            for hour, minute in [(9, 0), (9, 45), (10, 30), (11, 15), (18, 0), (18, 30), (19, 15)]:
-                start = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                end = start + timedelta(minutes=30)
-                for doctor_id, _, _, _ in _SEED_DOCTORS:
-                    sid = f"s_{doctor_id}_{start.strftime('%m%d_%H%M')}"
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO slots(slot_id, doctor_id, start, end, taken_by) VALUES(?,?,?,?,NULL)",
-                        (sid, doctor_id, _s(start), _s(end)),
-                    )
+        for sid, doctor_id, start, end in seed_slots(base_monday):
+            self._conn.execute(
+                "INSERT OR IGNORE INTO slots(slot_id, doctor_id, start, end, taken_by) VALUES(?,?,?,?,NULL)",
+                (sid, doctor_id, start, end),
+            )
         self._conn.commit()
 
     # ---------- READ ----------
@@ -368,6 +342,32 @@ class MockSqliteClinic:
                 except Exception:
                     pass
                 raise
+
+    def purge_stale_idempotency_keys(self, older_than_days: int = 30) -> int:
+        """Retire idempotency keys of NON-ACTIVE appointments older than N days.
+
+        The appointment rows stay for audit; only the dedup key is rewritten,
+        so the UNIQUE budget does not grow forever. ACTIVE bookings are never
+        touched: a late retry must still dedup instead of double-booking.
+        Returns the number of retired keys.
+        """
+        from datetime import datetime as _now
+
+        cutoff = _s(_now.now() - timedelta(days=older_than_days))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT booking_id, idempotency_key FROM appointments
+                   WHERE status != 'active' AND created_at < ?
+                   AND idempotency_key NOT LIKE 'purged:%'""",
+                (cutoff,),
+            ).fetchall()
+            for r in rows:
+                self._conn.execute(
+                    "UPDATE appointments SET idempotency_key=? WHERE booking_id=?",
+                    (f"purged:{r['booking_id']}", r["booking_id"]),
+                )
+            self._conn.commit()
+            return len(rows)
 
     # test-only helper: simulate a race by taking a slot out-of-band
     def steal_slot(self, slot_id: str, by: str = "other_patient") -> None:

@@ -50,6 +50,34 @@ def test_race_stolen_slot_raises():
         a.create_appointment(cmd)
 
 
+def test_purge_touches_only_stale_non_active_keys():
+    a = MockSqliteClinic()
+    p = PatientRef(patient_id="p-purge")
+    created = a.create_appointment(_cmd(a, patient_id="p-purge"))
+    target = next(s for s in a.find_slots(limit=20) if s.slot.start != created.start)
+    moved = a.reschedule_appointment(
+        RescheduleCommand(
+            patient=p, booking_id=created.booking_id,
+            new_slot_id=target.slot.slot_id, idempotency_key=f"ik-{uuid.uuid4().hex[:10]}",
+        )
+    )
+    # backdate the moved (non-active) record beyond TTL
+    a._conn.execute(
+        "UPDATE appointments SET created_at=? WHERE booking_id=?",
+        ("2020-01-01T00:00", created.booking_id),
+    )
+    a._conn.commit()
+    assert a.purge_stale_idempotency_keys(older_than_days=30) == 1
+    # active booking key untouched: replay still dedups
+    again = a.create_appointment(
+        CreateAppointmentCommand(
+            patient=p, slot_id="s_other", idempotency_key=moved.idempotency_key
+        )
+    )
+    assert again.booking_id == moved.booking_id
+    assert len(a.get_appointments(p)) == 1
+
+
 def test_reschedule_moves_atomically():
     a = MockSqliteClinic()
     p = PatientRef(patient_id="p9")
