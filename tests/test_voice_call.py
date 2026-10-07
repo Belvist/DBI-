@@ -109,6 +109,34 @@ def test_barge_in_cancels_tts():
     assert not call.barged_in()
 
 
+def test_ws_barge_invalidates_inflight_pipeline():
+    import queue
+
+    from api.voice_call import _Shared, _barge
+
+    class FakeTaskGroup:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def start_soon(self, fn, *args) -> None:
+            self.calls.append((fn, args))
+
+    shared = _Shared(seq=7, speaking=True, tts_gen="g-live")
+    out = queue.Queue()
+    tts = FakeTTS()
+    tg = FakeTaskGroup()
+
+    _barge(shared, out, tts, tg)
+
+    assert shared.seq == 8
+    assert not shared.speaking
+    assert shared.tts_gen is None
+    kind, payload = out.get_nowait()
+    assert kind == "stop"
+    assert payload == {"type": "stop", "gen": "g-live"}
+    assert tg.calls and tg.calls[0][1][-1] == "g-live"
+
+
 def test_superseded_turn_is_dropped():
     call, _ = _call()
     call.seq = 5
