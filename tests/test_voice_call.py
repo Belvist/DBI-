@@ -143,6 +143,41 @@ def test_superseded_turn_is_dropped():
     assert call.process_utterance(_tone(0.5), 4, "call-x") is None
 
 
+def test_streaming_barge_drops_first_stale_audio():
+    import queue
+
+    from voice.call import run_pipeline_streaming
+
+    class StreamingTTS(FakeTTS):
+        def synthesize_stream(self, text: str, call_id=None):
+            yield 16000, b"\x01\x02" * 1600, "g-race", False
+
+    tts = StreamingTTS()
+    call = CallSession(
+        FakeSTT(), tts, lambda text: (f"echo:{text}", {}),
+        vad=EnergyVad(),
+    )
+    out = queue.Queue()
+    live = {"value": True}
+
+    def on_speak(gen_id: str) -> None:
+        out.put(("speak", {"gen": gen_id}))
+        # Simulate a barge racing exactly with generation activation.
+        live["value"] = False
+
+    run_pipeline_streaming(
+        call, _tone(0.5), 1, "call-race", out,
+        is_live=lambda: live["value"], on_speak=on_speak,
+    )
+
+    items = []
+    while not out.empty():
+        items.append(out.get_nowait())
+    assert any(item[0] == "speak" for item in items)
+    assert not any(item[0] == "audio" for item in items)
+    assert tts.cancelled == ["g-race"]
+
+
 def test_ws_call_rejects_anonymous():
     with pytest.raises(WebSocketDisconnect), client.websocket_connect("/voice/ws-call"):
         pass
