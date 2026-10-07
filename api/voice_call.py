@@ -135,6 +135,10 @@ async def _receiver(ws, call, shared: _Shared, out: queue.Queue, tts, tg, call_i
             if msg.get("bytes"):
                 started, utt = call.feed_pcm(msg["bytes"])
                 if started:
+                    log.debug("call=%s vad speech started", call_id)
+                if utt is not None:
+                    log.debug("call=%s vad utterance bytes=%d", call_id, len(utt))
+                if started:
                     with shared.lock:
                         speaking = shared.speaking
                     if speaking:

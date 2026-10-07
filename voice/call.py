@@ -110,8 +110,13 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
             return is_live()
         return seq == call.seq
 
+    import logging as _logging
+
+    _log = _logging.getLogger("dbi.voice")
     try:
+        _log.debug("call=%s pipeline start bytes=%d", call_id, len(utt))
         text = call.stt.transcribe_pcm16(utt, call_id=call_id)
+        _log.debug("call=%s stt text=%r", call_id, text[:60])
     except Exception:
         log.exception("voice STT failed call_id=%s", call_id)
         out.put(("error", {"type": "error", "detail": "speech recognition unavailable"}))
@@ -135,6 +140,7 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
         "booking_id": info.get("booking_id"),
     }))
     try:
+        _log.debug("call=%s tts request text=%r", call_id, speech[:60])
         stream = call.tts.synthesize_stream(speech, call_id=call_id)
         first = True
         for rate, chunk, gen_id, _done in stream:
@@ -147,8 +153,10 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
             if first:
                 if on_speak is not None:
                     on_speak(gen_id)
-                else:
-                    out.put(("speak", {"gen": gen_id, "rate": rate}))
+                # Always publish activation: the sender tracks the live
+                # generation ONLY through ("speak") messages. Without it,
+                # every audio frame looks stale and is dropped.
+                out.put(("speak", {"gen": gen_id, "rate": rate}))
                 first = False
                 # Barge-in may have invalidated this generation inside
                 # on_speak/just after activation. Never enqueue its first
