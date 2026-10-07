@@ -180,10 +180,14 @@ async def _pipeline(call, shared: _Shared, out: queue.Queue, tts, utt: bytes,
             return my == shared.seq
 
     def _on_speak(gen_id: str) -> None:
+        # Publish generation activation while holding the same lock used by
+        # _barge(). This guarantees queue order: "speak" is visible before a
+        # competing "stop"; stale audio queued afterwards is then dropped.
         with shared.lock:
             if my == shared.seq:
                 shared.speaking = True
                 shared.tts_gen = gen_id
+                out.put(("speak", {"gen": gen_id}))
 
     def produce() -> None:
         from voice.call import run_pipeline_streaming
