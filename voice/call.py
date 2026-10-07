@@ -112,8 +112,9 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
 
     try:
         text = call.stt.transcribe_pcm16(utt, call_id=call_id)
-    except Exception as e:
-        out.put(("error", {"type": "error", "detail": f"stt failed: {e}"}))
+    except Exception:
+        log.exception("voice STT failed call_id=%s", call_id)
+        out.put(("error", {"type": "error", "detail": "speech recognition unavailable"}))
         return
     if not live():
         return
@@ -122,8 +123,9 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
         return
     try:
         speech, info = call.turn_fn(text)
-    except Exception as e:
-        out.put(("error", {"type": "error", "detail": f"turn failed: {e}"}))
+    except Exception:
+        log.exception("voice dialogue turn failed call_id=%s", call_id)
+        out.put(("error", {"type": "error", "detail": "service temporarily unavailable"}))
         return
     if not live():
         return
@@ -151,9 +153,10 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
                 "gen": gen_id, "rate": rate, "bytes": len(chunk),
                 "chunk": chunk,
             }))
-    except Exception as e:
+    except Exception:
         if live():
-            out.put(("error", {"type": "error", "detail": f"tts failed: {e}"}))
+            log.exception("voice TTS failed call_id=%s", call_id)
+            out.put(("error", {"type": "error", "detail": "speech synthesis unavailable"}))
 
 
 def new_call_id() -> str:
