@@ -86,6 +86,16 @@ async def voice_call(ws: WebSocket) -> None:
         try:
             await _receiver(ws, call, shared, out, tts, tg, call_id)
         finally:
+            # Invalidate any in-flight pipeline before tearing the socket down.
+            # If TTS is active, close the stream and notify the worker so a
+            # disconnected caller cannot leave expensive synthesis running.
+            with shared.lock:
+                shared.seq += 1
+                gen = shared.tts_gen
+                shared.speaking = False
+                shared.tts_gen = None
+            if gen is not None:
+                await anyio.to_thread.run_sync(tts.cancel, gen)
             out.put(("closed",))
             tg.cancel_scope.cancel()
 
@@ -128,7 +138,7 @@ async def _receiver(ws, call, shared: _Shared, out: queue.Queue, tts, tg, call_i
                     with shared.lock:
                         speaking = shared.speaking
                     if speaking:
-                        _barge(call, shared, out, tts, tg)
+                        _barge(shared, out, tts, tg)
                 if utt is not None:
                     with shared.lock:
                         shared.seq += 1
@@ -148,9 +158,13 @@ async def _receiver(ws, call, shared: _Shared, out: queue.Queue, tts, tg, call_i
         return
 
 
-def _barge(call, shared: _Shared, out: queue.Queue, tts, tg) -> None:
+def _barge(shared: _Shared, out: queue.Queue, tts, tg) -> None:
     """Immediate barge-in: doom the turn, stop the client, cancel TTS."""
     with shared.lock:
+        # Invalidate the current pipeline at speech START, not when the new
+        # utterance eventually endpoints. Otherwise a cancelled old pipeline
+        # can still consider itself live and emit stale audio/errors.
+        shared.seq += 1
         gen = shared.tts_gen
         shared.speaking = False
         shared.tts_gen = None
