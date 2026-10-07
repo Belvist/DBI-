@@ -106,7 +106,41 @@ def _resolve_dates(t: str, now: datetime) -> tuple[datetime | None, datetime | N
 
 
 _CONFIRM = re.compile(r"^(да|давайте|хорошо|соглас|подтверждаю|записывай|половина|в \d|перв|втор|подходит|беру)")
-_DENY = re.compile(r"(нет|не могу|не подходит|не надо|отмен|вообще не|другой)")
+
+# NB: all "не ..." denials REQUIRE a word boundary before "не".
+# Without it "мне надо" / "мне подходит" false-positive as a refusal.
+_DENY_STRONG = re.compile(r"вообще не")
+_DENY_NEG = re.compile(r"\bне\s+(могу|подходит|надо|хочу|устраивает)\b")
+
+# hour words, longest first ("восемь" contains "семь" — order matters)
+_HOUR_WORDS: list[tuple[str, int]] = [
+    ("двадцат", 20), ("девятнадцат", 19), ("восемнадцат", 18),
+    ("семнадцат", 17), ("шестнадцат", 16), ("пятнадцат", 15),
+    ("четырнадцат", 14), ("тринадцат", 13), ("двенадцат", 12),
+    ("одиннадцат", 11), ("десят", 10), ("девят", 9), ("восьм", 8),
+    ("семь", 7), ("шесть", 6), ("пять", 5),
+]
+
+
+def _extract_exact_time(t: str) -> str | None:
+    """"в 20:00" / "где-то в 20" / "к восьми вечера" -> "HH:MM"."""
+    m = re.search(r"(\d{1,2})[:.](\d{2})", t)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+    m = re.search(r"\bв\s+(\d{1,2})\b", t)
+    hour: int | None = int(m.group(1)) if m else None
+    if hour is None:
+        for stem, h in _HOUR_WORDS:
+            if re.search(rf"\b{stem}\w*", t):
+                hour = h
+                break
+    if hour is None or not 0 <= hour <= 23:
+        return None
+    if hour < 12 and re.search(r"вечер", t):
+        hour += 12
+    return f"{hour:02d}:00"
 
 
 def parse(text: str, now: datetime | None = None) -> NLUResult:
@@ -115,36 +149,50 @@ def parse(text: str, now: datetime | None = None) -> NLUResult:
     spec = _find_specialty(t)
     doc = _find_doctor(t)
     df, dt, tpref = _resolve_dates(t, now)
+    exact = _extract_exact_time(t)
 
     # status of existing booking
     if re.search(r"(когда|какая|на какое время|моя запись|я записан|статус)", t) and re.search(
         r"(запиш|запис|прием|приём|врач)", t
     ):
         return NLUResult(intent=Intent.GET_STATUS, specialty=spec, doctor_text=doc,
-                          date_from=df, date_to=dt, time_preference=tpref, confidence=0.9)
+                          date_from=df, date_to=dt, time_preference=tpref,
+                          exact_time=exact, confidence=0.9)
     # reschedule
     if re.search(r"(перенес|перенести|перезапис|не смогу|давай в|другое время|поменять)", t):
         return NLUResult(intent=Intent.RESCHEDULE, specialty=spec, doctor_text=doc,
                           date_from=df, date_to=dt, time_preference=tpref,
-                          raw_time_text=text, confidence=0.9)
+                          exact_time=exact, raw_time_text=text, confidence=0.9)
     # schedule inquiry
     if re.search(r"(расписание|кто (принимает|работает)|когда принимает|часы приема|свободно)", t):
         return NLUResult(intent=Intent.GET_SCHEDULE, specialty=spec, doctor_text=doc,
-                          date_from=df, date_to=dt, time_preference=tpref, confidence=0.85)
+                          date_from=df, date_to=dt, time_preference=tpref,
+                          exact_time=exact, confidence=0.85)
     # booking request first: "давайте запишите..." is BOOK, not CONFIRM
     if re.search(r"(запиш|запис|прием|приём|хочу к|нужен|нужна|ко врачу|доктор)", t):
         return NLUResult(intent=Intent.BOOK, specialty=spec, doctor_text=doc,
                           date_from=df, date_to=dt, time_preference=tpref,
-                          raw_time_text=text, confidence=0.9 if (spec or doc) else 0.6)
-    # strong denial beats correction: "вторник вообще не могу", "не подходит"
-    if re.search(r"(вообще не|не могу|не подходит|не надо|не хочу|не устраивает)", t):
+                          exact_time=exact, raw_time_text=text,
+                          confidence=0.9 if (spec or doc) else 0.6)
+    # exact-time wish without a booking verb: "мне надо в 20:00",
+    # "какие свободы на 20:00", "есть что-то на восемь вечера"
+    if exact is not None and re.search(
+        r"(надо|хочу|нужен|нужна|можно|есть|свобод|какие|время|слот|мест)", t
+    ):
+        return NLUResult(intent=Intent.BOOK, specialty=spec, doctor_text=doc,
+                          date_from=df, date_to=dt, time_preference=tpref,
+                          exact_time=exact, raw_time_text=text,
+                          confidence=0.8 if (spec or doc or df) else 0.55)
+    # strong denial beats correction: "вторник вообще не могу", "не подходит".
+    # \b before "не" is load-bearing: "мне надо" must NOT match.
+    if _DENY_STRONG.search(t) or _DENY_NEG.search(t):
         return NLUResult(intent=Intent.DENY, confidence=0.88)
     # strict correction "не среда, четверг": weekday after "не" + another weekday
     _wds = "понедельник|вторник|среду|среда|четверг|пятницу|пятница|субботу|воскресенье"
-    if re.search(rf"не\s+({_wds})\W+({_wds})", t):
+    if re.search(rf"\bне\s+({_wds})\W+({_wds})", t):
         return NLUResult(intent=Intent.CORRECT, specialty=spec, doctor_text=doc,
                           date_from=df, date_to=dt, time_preference=tpref,
-                          raw_time_text=text, confidence=0.8)
+                          exact_time=exact, raw_time_text=text, confidence=0.8)
     # bare denial
     if t.strip() in ("нет", "не могу", "не подходит", "нет, не могу"):
         return NLUResult(intent=Intent.DENY, confidence=0.85)
@@ -156,9 +204,10 @@ def parse(text: str, now: datetime | None = None) -> NLUResult:
         elif "втор" in t and "вариант" in t:
             slot_idx = 1
         return NLUResult(intent=Intent.CONFIRM, slot_index=slot_idx,
-                          raw_time_text=text, confidence=0.8)
+                          exact_time=exact, raw_time_text=text, confidence=0.8)
     # bare specialty mention in booking context ("к неврологу")
     if spec and len(t.split()) <= 4:
         return NLUResult(intent=Intent.BOOK, specialty=spec, confidence=0.75)
     return NLUResult(intent=Intent.UNKNOWN, specialty=spec, doctor_text=doc,
-                      date_from=df, date_to=dt, time_preference=tpref, confidence=0.3)
+                      date_from=df, date_to=dt, time_preference=tpref,
+                      exact_time=exact, confidence=0.3)

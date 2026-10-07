@@ -137,5 +137,15 @@ def outcome_unknown() -> str:
     )
 
 
+def no_exact_time(exact_time: str, alternatives: list) -> str:
+    lines = [f"{i + 1}. {fmt_slot(s)}" for i, s in enumerate(alternatives[:3])]
+    pretty = exact_time
+    return (
+        f"Ровно в {pretty} свободного времени нет. Ближайшее:\n"
+        + "\n".join(lines)
+        + "\nПодойдёт что-то из этого?"
+    )
+
+
 def unknown() -> str:
     return "Не совсем поняла. Вы хотите записаться, узнать свою запись или перенести её?"

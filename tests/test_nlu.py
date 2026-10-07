@@ -34,3 +34,23 @@ def test_reschedule_intent():
 def test_half_past_six_confirm():
     r = det.parse("Давайте половину седьмого", NOW)
     assert r.intent == Intent.CONFIRM
+
+
+def test_mne_nado_is_not_deny():
+    # "мне надо" contains "не надо" as substring — must NOT match.
+    for t in ["Блин мне надо где-то в 20:00", "Мне подходит вторник", "Мне надо к врачу"]:
+        assert det.parse(t, NOW).intent != Intent.DENY, t
+
+
+def test_real_deny_still_works():
+    for t in ["Нет, вторник вообще не могу", "Не подходит", "Не надо"]:
+        assert det.parse(t, NOW).intent == Intent.DENY, t
+
+
+def test_exact_time_requests():
+    r = det.parse("мне надо где-то в 20:00", NOW)
+    assert r.intent == Intent.BOOK and r.exact_time == "20:00"
+    r = det.parse("А какие свободы на 20:00", NOW)
+    assert r.intent == Intent.BOOK and r.exact_time == "20:00"
+    r = det.parse("давай к восьми вечера", NOW)
+    assert r.exact_time == "20:00"

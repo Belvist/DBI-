@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from api.booking_service import DialogueSession
+from api.voice_call import router as voice_call_router
 from api.voice_ws import router as voice_router
 from clinic_adapter.mock_sqlite import MockSqliteClinic
 from clinic_adapter.postgres import PostgresClinic
@@ -20,13 +21,12 @@ from observability import metrics
 from observability.clock import resolve_clock
 from sessions.coordinator import run_turn
 from sessions.store import SessionStore
-from voice.stt import BrowserSTT
-from voice.tts import BrowserTTS
 
 log = logging.getLogger("dbi.api")
 
-app = FastAPI(title="DBI Clinic Assistant", version="0.2.0")
+app = FastAPI(title="DBI Clinic Assistant", version="0.3.0")
 app.include_router(voice_router)
+app.include_router(voice_call_router)
 
 _SETTINGS = load_settings()
 if _SETTINGS.pg_url:
@@ -49,8 +49,10 @@ else:
     log.info("snapshots=sqlite path=%s", _SETTINGS.sessions_path)
 _CLOCK = resolve_clock(_SETTINGS.env, _SETTINGS.clock_override)
 log.info("clock=%s", type(_CLOCK).__name__)
-_STT = BrowserSTT()
-_TTS = BrowserTTS()
+from voice.voiseup import VoiseupSTT, VoiseupTTS
+
+_STT = VoiseupSTT(_SETTINGS.voice_stt_url)
+_TTS = VoiseupTTS(_SETTINGS.voice_tts_url)
 
 
 def _session(patient: PatientRef) -> DialogueSession:
@@ -95,6 +97,9 @@ app.state.identity = _IDENTITY
 app.state.snapshots = _SNAPSHOTS
 app.state.redis_url = _SETTINGS.redis_url
 app.state.clock = _CLOCK
+app.state.session_adapter = lambda: _ADAPTER
+app.state.voice_stt_url = _SETTINGS.voice_stt_url
+app.state.voice_tts_url = _SETTINGS.voice_tts_url
 app.state.base_adapter = _BASE
 
 
@@ -196,6 +201,64 @@ def dialogue_turn(
         "flow": sess.state.flow.value,
         "trace": [{"seq": e.seq, "kind": e.kind, "data": e.data} for e in sess.trace.events[-8:]],
     }
+
+
+@app.post("/voice/transcribe")
+async def voice_transcribe(
+    request: Request,
+    sample_rate: int = 16000,
+    x_patient_token: str | None = Header(default=None, alias="X-Patient-Token"),
+):
+    """One utterance (int16 mono PCM body) -> text via voiseup GigaAM."""
+    from fastapi import HTTPException
+
+    from voice.voiseup import VoiceEngineError, VoiseupSTT
+
+    try:
+        identify_patient(_IDENTITY, x_patient_token)
+    except HTTPException as e:
+        if e.status_code in (401, 403):
+            metrics.inc("auth_failures_total")
+        raise
+    pcm = await request.body()
+    try:
+        text = VoiseupSTT(_SETTINGS.voice_stt_url).transcribe_pcm16(pcm, sample_rate)
+    except VoiceEngineError as e:
+        raise HTTPException(status_code=503, detail="speech recognition unavailable") from e
+    return {"text": text}
+
+
+@app.post("/voice/speak")
+def voice_speak(
+    body: dict,
+    x_patient_token: str | None = Header(default=None, alias="X-Patient-Token"),
+):
+    """Assistant text -> WAV (int16 mono) via voiseup Qwen-TTS."""
+    import io
+    import wave
+
+    from fastapi import HTTPException
+    from fastapi.responses import Response
+
+    from voice.voiseup import VoiceEngineError, VoiseupTTS
+
+    try:
+        identify_patient(_IDENTITY, x_patient_token)
+    except HTTPException as e:
+        if e.status_code in (401, 403):
+            metrics.inc("auth_failures_total")
+        raise
+    try:
+        rate, pcm, _ = VoiseupTTS(_SETTINGS.voice_tts_url).synthesize(str(body.get("text", "")))
+    except VoiceEngineError as e:
+        raise HTTPException(status_code=503, detail="speech synthesis unavailable") from e
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return Response(content=buf.getvalue(), media_type="audio/wav")
 
 
 @app.get("/voice", response_class=HTMLResponse)

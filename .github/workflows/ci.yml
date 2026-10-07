@@ -86,7 +86,7 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:18080/health && break || sleep 1; done
           curl -sf http://127.0.0.1:18080/ > /dev/null
           curl -sf http://127.0.0.1:18080/health > /dev/null
-          curl -sf http://127.0.0.1:18080/voice | grep -q "Говорить"
+          curl -sf http://127.0.0.1:18080/voice | grep -q 'id="callBtn"'
           curl -sf http://127.0.0.1:18080/ready > /dev/null
           python - <<'EOF'
           import asyncio, json
@@ -98,6 +98,14 @@ jobs:
                   await ws.send(json.dumps({"type": "user_text", "text": "Запиши меня к неврологу"}))
                   msg = json.loads(await ws.recv())
                   assert msg["type"] == "speech", msg
+              async with connect(
+                  "ws://127.0.0.1:18080/voice/ws-call", subprotocols=["dbi-voice", "demo"]
+              ) as ws:
+                  ready = json.loads(await ws.recv())
+                  assert ready["type"] == "ready" and ready["call_id"], ready
+                  await ws.send(json.dumps({"type": "ping"}))
+                  pong = json.loads(await ws.recv())
+                  assert pong["type"] == "pong", pong
           asyncio.run(main())
           EOF
           pkill -f "uvicorn api.main:app --host 127.0.0.1 --port 18080" || true

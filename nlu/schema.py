@@ -25,6 +25,7 @@ class NLUResult(BaseModel):
     date_from: datetime | None = None
     date_to: datetime | None = None
     time_preference: str | None = None  # "morning" | "evening" | None
+    exact_time: str | None = None  # "20:00" — конкретное время ("в восемь вечера")
     slot_index: int | None = None  # "первый вариант", "половина седьмого" resolved later
     raw_time_text: str | None = None
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)

@@ -25,19 +25,27 @@ class DialogueSession:
     """One patient conversation. Holds state + trace + last grounded facts."""
 
     def __init__(self, patient: PatientRef, adapter: ClinicAdapter,
-                 now: datetime | None = None) -> None:
+                 now: datetime | None = None, trace: Trace | None = None) -> None:
         self.patient = patient
         self.adapter = adapter
         self.state = DialogueState(patient=patient)
-        self.trace = Trace()
+        self.trace = trace or Trace()
         self.now = now or datetime.now()
         self.proposer = LlmProposer()
         self._allowed_dts: list[datetime] = []
         self._allowed_bids: list[str] = []
 
     def turn(self, text: str, idempotency_key: str | None = None) -> str:
+        import re
+
         metrics.inc("turns_total")
         det_out = det.parse(text, now=self.now)
+        # Times the user SAID ("в 8 вечера" -> exact 20:00) may be echoed
+        # back in a negation. Digits alone miss word forms, so union the
+        # parsed exact time too.
+        user_times = set(re.findall(r"(?<!\d)(\d{1,2}:\d{2})(?!\d)", text))
+        if det_out.exact_time:
+            user_times.add(det_out.exact_time)
         fused = fuse(det_out, self.proposer.propose(text, self.now))
         ctx = TurnCtx(now=self.now, trace=self.trace)
         if idempotency_key:
@@ -45,7 +53,7 @@ class DialogueSession:
             ctx.idempotency_key_explicit = True
         self.state, speech = step(self.state, fused, self.adapter, ctx)
         self._refresh_allowlist()
-        ok, safe = validate(speech, self._allowed_dts, self._allowed_bids)
+        ok, safe = validate(speech, self._allowed_dts, self._allowed_bids, user_times)
         if not ok:
             self.trace.log("hallucination_blocked", draft=speech[:120])
             metrics.inc("fallbacks_total")

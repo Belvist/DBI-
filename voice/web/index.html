@@ -2,7 +2,7 @@
 <html lang="ru">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DBI Assistant — голосовое демо</title>
+<title>DBI Assistant — звонок</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
   #log { border: 1px solid #ccc; border-radius: 8px; min-height: 220px; max-height: 380px;
@@ -12,147 +12,187 @@
   #dash { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
   #dash div { border: 1px solid #ddd; border-radius: 8px; padding: 8px; font-size: 0.9em; }
   #dash b { display: block; font-size: 0.75em; color: #666; text-transform: uppercase; }
-  button { font-size: 1em; padding: 8px 16px; margin-right: 8px; cursor: pointer; }
-  #micBtn.live { background: #d93025; color: #fff; }
+  button { font-size: 1.1em; padding: 10px 20px; margin-right: 8px; cursor: pointer; }
+  #callBtn.live { background: #137333; color: #fff; }
+  #status { font-weight: bold; margin: 8px 0; }
   input[type=text] { width: 70%; padding: 8px; }
 </style>
-<h2>DBI Assistant — голосовой администратор клиники</h2>
+<h2>DBI Assistant — звонок в клинику</h2>
 <div id="dash">
   <div><b>Состояние</b><span id="dState">—</span></div>
   <div><b>Запись</b><span id="dBooking">—</span></div>
-  <div><b>Задержка хода</b><span id="dLat">—</span></div>
+  <div><b>Статус</b><span id="dStatus">не в звонке</span></div>
 </div>
 <div>
   <input type="text" id="tokenIn" value="demo" size="16" title="Bearer-токен пациента">
-  <button id="connBtn">Подключить</button>
-  <button id="micBtn" disabled>🎤 Говорить</button>
-  <button id="stopBtn">⏹ Стоп</button>
+  <button id="callBtn">📞 Позвонить</button>
 </div>
+<div id="status"></div>
 <div id="log"></div>
 <div>
   <input type="text" id="textIn" placeholder="Текстовый фолбэк: Хочу записаться к неврологу…">
   <button id="sendBtn">➤</button>
 </div>
-<p class="sys">STT/TTS — браузерные (Web Speech API, ru-RU). Перебивание: заговорите поверх ответа —
-синтез остановится мгновенно, сервер получит barge_in. Требует Chrome и микрофон (localhost/HTTPS).</p>
+<p class="sys">Режим звонка: микрофон стримится непрерывно, конец фразы определяет VAD на сервере,
+ответ можно перебивать — синтез остановится. STT GigaAM + TTS Qwen, задержка ответа ~5–8с на CPU.</p>
 <script>
 const log = document.getElementById("log");
-const micBtn = document.getElementById("micBtn");
-let speaking = false, micOn = false, lastGen = null;
-let ws = null;
-// Auth через subprotocol (не query string — токен не должен попадать в логи):
-// ["dbi-voice", "<bearer-token>"]. Пациент определяется только сервером.
-function connect() {
-  const token = document.getElementById("tokenIn").value.trim();
-  if (ws) { try { ws.close(); } catch (_) {} }
-  ws = new WebSocket(
-    (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/voice/ws",
-    ["dbi-voice", token]
-  );
-  ws.onopen = () => { sys("Соединение открыто. Нажмите «Говорить»."); micBtn.disabled = false; };
-  ws.onclose = (e) => {
-    sys(e.code === 4401 ? "Отказ: неверный токен (4401)." : "Соединение закрыто. Обновите страницу.");
-    micBtn.disabled = true;
-  };
-  ws.onmessage = onServerMessage;
-}
-document.getElementById("connBtn").onclick = connect;
+const callBtn = document.getElementById("callBtn");
+const statusEl = document.getElementById("status");
+let ws = null, inCall = false;
+let micCtx = null, micStream = null, micNode = null;
+let playCtx = null, playQueue = [], playing = false, curSource = null;
 
+function token() { return document.getElementById("tokenIn").value.trim(); }
 function line(cls, who, text) {
   const d = document.createElement("div");
   d.className = cls; d.textContent = who + text;
   log.appendChild(d); log.scrollTop = log.scrollHeight;
 }
 function sys(t) { line("sys", "", t); }
+function setStatus(t) {
+  statusEl.textContent = t;
+  document.getElementById("dStatus").textContent = t;
+}
 
-function onServerMessage(ev) {
-  const m = JSON.parse(ev.data);
-  if (m.type === "speech") {
-    lastGen = m.gen_id;
-    document.getElementById("dState").textContent = m.flow + " / " + m.phase;
-    document.getElementById("dBooking").textContent = m.booking_id || "—";
-    document.getElementById("dLat").textContent = m.t_ms + " мс";
-    line("a", "Ассистент: ", m.text);
-    speak(m.text, m.gen_id);
-  } else if (m.type === "superseded") {
-    sys("Ход отменён перебиванием (" + m.gen_id + ").");
-  } else if (m.type === "stopped") {
-    sys("Остановлено (" + m.gen_id + "). Слушаю…");
-  } else if (m.type === "error") {
-    sys("Ошибка: " + m.detail);
+const WORKLET = `class Cap extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = []; this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) { this.buf.push(ch.slice(0)); this.n += ch.length;
+      if (this.n >= 1600) {
+        const out = new Float32Array(this.n); let o = 0;
+        for (const c of this.buf) { out.set(c, o); o += c.length; }
+        this.port.postMessage(out); this.buf = []; this.n = 0;
+      }
+    }
+    return true;
   }
+} registerProcessor('cap', Cap);`;
+
+function downsample(buf, fromRate, toRate) {
+  if (fromRate === toRate) return buf;
+  const ratio = fromRate / toRate;
+  const out = new Float32Array(Math.floor(buf.length / ratio));
+  for (let i = 0; i < out.length; i++) out[i] = buf[Math.floor(i * ratio)];
+  return out;
 }
 
-function pickRuVoice() {
-  const vs = speechSynthesis.getVoices();
-  return vs.find(v => v.lang.startsWith("ru")) || null;
-}
-if ("speechSynthesis" in window) speechSynthesis.getVoices();
-
-function speak(text, genId) {
-  if (!("speechSynthesis" in window)) { sys("TTS недоступен в этом браузере."); return; }
-  speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = "ru-RU";
-  const v = pickRuVoice(); if (v) u.voice = v;
-  u.onstart = () => { speaking = true; };
-  u.onend = u.onerror = () => { speaking = false; };
-  u._gen = genId;
-  speechSynthesis.speak(u);
-}
-function stopSpeaking() {
-  if ("speechSynthesis" in window) speechSynthesis.cancel();
-  speaking = false;
-}
-function send(obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) { sys("Нет соединения — нажмите «Подключить»."); return; }
-  ws.send(JSON.stringify(obj));
-}
-
-// ---- mic: Web Speech API, ru-RU, interim -> instant barge-in ----
-const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null;
-if (!Rec) {
-  sys("Распознавание речи недоступно — используйте Chrome и текстовый фолбэк.");
-  micBtn.disabled = true;
-} else {
-  rec = new Rec();
-  rec.lang = "ru-RU"; rec.interimResults = true; rec.continuous = false;
-  rec.onresult = (e) => {
-    let interim = "", fin = "";
-    for (const r of e.results) { if (r.isFinal) fin += r[0].transcript; else interim += r[0].transcript; }
-    const heard = (fin || interim).trim();
-    if (!heard) return;
-    if (speaking && interim) {
-      // instant local barge-in + server-side cancel
-      stopSpeaking();
-      send({ type: "barge_in" });
-    }
-    if (fin) {
-      line("u", "Пациент: ", heard);
-      send({ type: "user_text", text: heard });
-    }
+async function startCall() {
+  const t = token();
+  ws = new WebSocket(
+    (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/voice/ws-call",
+    ["dbi-voice", t]
+  );
+  ws.binaryType = "arraybuffer";
+  ws.onopen = async () => {
+    micStream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true}});
+    micCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+    await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: "application/javascript"})));
+    const src = micCtx.createMediaStreamSource(micStream);
+    micNode = new AudioWorkletNode(micCtx, "cap");
+    const devRate = micCtx.sampleRate;
+    micNode.port.onmessage = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const ds = downsample(e.data, devRate, 16000);
+      const pcm = new Int16Array(ds.length);
+      for (let i = 0; i < ds.length; i++) {
+        const s = Math.max(-1, Math.min(1, ds[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      ws.send(pcm.buffer);
+    };
+    src.connect(micNode);
+    playCtx = new (window.AudioContext || window.webkitAudioContext)();
+    inCall = true;
+    callBtn.classList.add("live"); callBtn.textContent = "📴 Положить трубку";
+    setStatus("слушаю…");
   };
-  rec.onend = () => { micOn = false; micBtn.classList.remove("live"); micBtn.textContent = "🎤 Говорить"; };
-  rec.onerror = (e) => sys("Mic: " + e.error);
+  ws.onmessage = onServerMessage;
+  ws.onclose = (e) => { endCall(); sys(e.code === 4401 ? "Отказ: неверный токен (4401)." : "Звонок завершён."); };
 }
-micBtn.onclick = () => {
-  if (!rec) return;
-  if (micOn) { rec.stop(); return; }
-  try { rec.start(); micOn = true; micBtn.classList.add("live"); micBtn.textContent = "● Слушаю…"; }
-  catch (e) { sys("Mic: " + e.message); }
+
+let pendingAudio = null;
+function onServerMessage(ev) {
+  if (typeof ev.data !== "string") { // raw PCM following an audio header
+    if (pendingAudio) playPcm(pendingAudio, ev.data);
+    pendingAudio = null;
+    return;
+  }
+  const m = JSON.parse(ev.data);
+  if (m.type === "ready") { sys("Соединение: " + m.call_id + ". Говорите."); }
+  else if (m.type === "turn") {
+    line("u", "Пациент: ", m.heard);
+    line("a", "Ассистент: ", m.text);
+    document.getElementById("dState").textContent = m.flow + " / " + m.phase;
+    if (m.booking_id) document.getElementById("dBooking").textContent = m.booking_id;
+    setStatus("говорю…");
+  }
+  else if (m.type === "audio") { pendingAudio = m; }
+  else if (m.type === "stop") { stopPlayback(); setStatus("слушаю… (перебили)"); }
+  else if (m.type === "heard") { sys("Не расслышал."); setStatus("слушаю…"); }
+  else if (m.type === "error") { sys("Ошибка: " + m.detail); setStatus("слушаю…"); }
+  else if (m.type === "pong") {}
+}
+
+function playPcm(meta, buf) {
+  const bytes = new Int16Array(buf);
+  const floats = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) floats[i] = bytes[i] / 32768;
+  const ab = playCtx.createBuffer(1, floats.length, meta.rate);
+  ab.getChannelData(0).set(floats);
+  playQueue.push(ab);
+  pumpQueue();
+}
+function pumpQueue() {
+  if (playing || !playQueue.length) return;
+  playing = true;
+  setStatus("говорю…");
+  const ab = playQueue.shift();
+  curSource = playCtx.createBufferSource();
+  curSource.buffer = ab;
+  curSource.connect(playCtx.destination);
+  curSource.onended = () => {
+    curSource = null; playing = false;
+    if (playQueue.length) pumpQueue(); else setStatus("слушаю…");
+  };
+  curSource.start();
+}
+function stopPlayback() {
+  playQueue = [];
+  if (curSource) { try { curSource.onended = null; curSource.stop(); } catch (_) {} curSource = null; }
+  playing = false;
+}
+
+async function endCall() {
+  inCall = false;
+  callBtn.classList.remove("live"); callBtn.textContent = "📞 Позвонить";
+  setStatus("не в звонке");
+  stopPlayback();
+  try { micNode && micNode.disconnect(); } catch (_) {}
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+  try { micCtx && await micCtx.close(); } catch (_) {}
+  try { playCtx && await playCtx.close(); } catch (_) {}
+  micCtx = micStream = micNode = playCtx = null;
+  if (ws) { try { ws.close(); } catch (_) {} ws = null; }
+}
+
+callBtn.onclick = async () => {
+  if (inCall || (ws && ws.readyState === WebSocket.OPEN)) { await endCall(); return; }
+  try { await startCall(); } catch (e) { sys("Mic/WS: " + e.message); }
 };
-document.getElementById("stopBtn").onclick = () => {
-  stopSpeaking();
-  if (rec && micOn) rec.stop();
-  send({ type: "barge_in" });
-};
-document.getElementById("sendBtn").onclick = () => {
+document.getElementById("sendBtn").onclick = async () => {
   const t = document.getElementById("textIn").value.trim();
   if (!t) return;
-  line("u", "Пациент: ", t);
-  send({ type: "user_text", text: t });
   document.getElementById("textIn").value = "";
+  const r = await fetch("/dialogue/turn", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Patient-Token": token()},
+    body: JSON.stringify({text: t}),
+  });
+  const j = await r.json();
+  line("u", "Пациент: ", t);
+  line("a", "Ассистент: ", j.speech);
 };
 </script>
 </html>

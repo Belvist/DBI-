@@ -24,6 +24,8 @@ class Settings:
     single_replica: bool
     metrics_token: str
     clock_override: str
+    voice_stt_url: str
+    voice_tts_url: str
     allow_seed: bool
 
 
@@ -81,5 +83,7 @@ def load(env: dict[str, str] | None = None) -> Settings:
         single_replica=single_replica,
         clock_override=src.get("DBI_CLOCK", ""),
         metrics_token=metrics_token,
+        voice_stt_url=src.get("DBI_VOICE_STT_URL", "http://127.0.0.1:9101"),
+        voice_tts_url=src.get("DBI_VOICE_TTS_URL", "http://127.0.0.1:9102"),
         allow_seed=allow_seed,
     )
