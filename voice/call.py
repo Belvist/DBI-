@@ -147,8 +147,18 @@ def run_pipeline_streaming(call, utt: bytes, seq: int, call_id: str, out,
             if first:
                 if on_speak is not None:
                     on_speak(gen_id)
-                out.put(("speak", {"gen": gen_id, "rate": rate}))
+                else:
+                    out.put(("speak", {"gen": gen_id, "rate": rate}))
                 first = False
+                # Barge-in may have invalidated this generation inside
+                # on_speak/just after activation. Never enqueue its first
+                # audio frame after a stop.
+                if not live():
+                    try:
+                        call.tts.cancel(gen_id)
+                    except Exception:
+                        pass
+                    return
             out.put(("audio", {
                 "gen": gen_id, "rate": rate, "bytes": len(chunk),
                 "chunk": chunk,
