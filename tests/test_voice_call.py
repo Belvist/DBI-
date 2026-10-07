@@ -112,7 +112,7 @@ def test_barge_in_cancels_tts():
 def test_ws_barge_invalidates_inflight_pipeline():
     import queue
 
-    from api.voice_call import _Shared, _barge
+    from api.voice_call import _barge, _Shared
 
     class FakeTaskGroup:
         def __init__(self) -> None:
